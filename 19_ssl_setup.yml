@@ -1,0 +1,474 @@
+---
+# =================================================================
+# 19_ssl_setup.yml - *.miso.local 와일드카드 SSL 적용
+#
+# 실행: ansible-playbook -i hosts.ini 19_ssl_setup.yml
+#
+# 사전 준비 (작업 PC에서 1회):
+#   bash 00_gen_certs.sh
+#   → ca.crt, tls.crt, tls.key, harbor.miso.local.crt/key 생성
+#   → 베스천 플레이북 디렉토리에 복사
+#
+# 적용 서비스:
+#   - monitor.miso.local      (Grafana     - Docker, nginx reverse proxy)
+#   - prometheus.miso.local  (Prometheus  - Docker, nginx reverse proxy)
+#   - alertmanager.miso.local (AlertManager - Docker, nginx reverse proxy)
+#   - argocd.miso.local   (ArgoCD  - K8s Ingress)
+#   - harbor.miso.local   (Harbor  - Docker, 인증서 교체)
+#   - dashboard.miso.local (OpenSearch Dashboards - K8s Ingress)
+# =================================================================
+
+- name: "SSL 인증서 적용"
+  hosts: bastion
+  become: no
+  gather_facts: false
+  environment:
+    KUBECONFIG: "{{ lookup('env', 'HOME') }}/.kube/config"
+  vars:
+    cert_dir: "{{ playbook_dir }}"
+    ca_cert:   "{{ playbook_dir }}/ca.crt"
+    tls_cert:  "{{ playbook_dir }}/tls.crt"
+    tls_key:   "{{ playbook_dir }}/tls.key"
+
+    # K8s wildcard secret 이름 (전 네임스페이스 공통)
+    wildcard_secret: "miso-wildcard-tls"
+
+    # 서비스별 설정
+    argocd_namespace: "argocd"
+    argocd_hostname:  "argocd.miso.local"
+
+    os_namespace: "default"
+    os_name:      "miso-opensearch"
+    os_dashboard_hostname: "dashboard.miso.local"
+
+  tasks:
+    # ---------------------------------------------------------------
+    # 0. 사전 파일 확인
+    # ---------------------------------------------------------------
+    - name: "0. 인증서 파일 존재 확인"
+      ansible.builtin.stat:
+        path: "{{ item }}"
+      loop:
+        - "{{ ca_cert }}"
+        - "{{ tls_cert }}"
+        - "{{ tls_key }}"
+      register: cert_check
+      delegate_to: localhost
+
+    - name: "0-b. 파일 누락 시 중단"
+      ansible.builtin.fail:
+        msg: |
+          인증서 파일이 없습니다: {{ item.item }}
+          먼저 실행하세요: bash 00_gen_certs.sh
+      loop: "{{ cert_check.results }}"
+      when: not item.stat.exists
+
+    # ---------------------------------------------------------------
+    # STEP 1. K8s wildcard TLS Secret 등록 (공통)
+    # ---------------------------------------------------------------
+    - name: "1-a. wildcard Secret - default 네임스페이스"
+      ansible.builtin.shell: |
+        kubectl create secret tls {{ wildcard_secret }} \
+          --cert={{ tls_cert }} \
+          --key={{ tls_key }} \
+          -n default \
+          --dry-run=client -o yaml | kubectl apply -f -
+      changed_when: true
+
+    - name: "1-b. wildcard Secret - argocd 네임스페이스"
+      ansible.builtin.shell: |
+        kubectl create secret tls {{ wildcard_secret }} \
+          --cert={{ tls_cert }} \
+          --key={{ tls_key }} \
+          -n {{ argocd_namespace }} \
+          --dry-run=client -o yaml | kubectl apply -f -
+      changed_when: true
+
+    # ---------------------------------------------------------------
+    # STEP 2. ArgoCD Ingress TLS 적용
+    # argocd는 ssl-passthrough → TLS termination 방식으로 변경
+    # ---------------------------------------------------------------
+    - name: "2. ArgoCD Ingress TLS 적용"
+      ansible.builtin.shell: |
+        kubectl apply -f - << 'YAMEOF'
+        apiVersion: networking.k8s.io/v1
+        kind: Ingress
+        metadata:
+          name: argocd-ingress
+          namespace: {{ argocd_namespace }}
+          annotations:
+            kubernetes.io/ingress.class: nginx
+            nginx.ingress.kubernetes.io/backend-protocol: "HTTPS"
+            nginx.ingress.kubernetes.io/ssl-passthrough: "false"
+            nginx.ingress.kubernetes.io/force-ssl-redirect: "true"
+        spec:
+          tls:
+          - hosts:
+            - {{ argocd_hostname }}
+            secretName: {{ wildcard_secret }}
+          rules:
+          - host: {{ argocd_hostname }}
+            http:
+              paths:
+              - path: /
+                pathType: Prefix
+                backend:
+                  service:
+                    name: argocd-server
+                    port:
+                      number: 443
+        YAMEOF
+      register: argocd_ingress
+      changed_when: "'created' in argocd_ingress.stdout or 'configured' in argocd_ingress.stdout"
+
+    # ---------------------------------------------------------------
+    # STEP 3. OpenSearch Dashboard Ingress TLS 적용
+    # ---------------------------------------------------------------
+    - name: "3. OpenSearch Dashboard Ingress TLS 적용"
+      ansible.builtin.shell: |
+        kubectl apply -f - << 'YAMEOF'
+        apiVersion: networking.k8s.io/v1
+        kind: Ingress
+        metadata:
+          name: opensearch-dashboard-ingress
+          namespace: {{ os_namespace }}
+          annotations:
+            kubernetes.io/ingress.class: nginx
+            nginx.ingress.kubernetes.io/backend-protocol: "HTTPS"
+            nginx.ingress.kubernetes.io/force-ssl-redirect: "true"
+            nginx.ingress.kubernetes.io/ssl-redirect: "true"
+        spec:
+          tls:
+          - hosts:
+            - {{ os_dashboard_hostname }}
+            secretName: {{ wildcard_secret }}
+          rules:
+          - host: {{ os_dashboard_hostname }}
+            http:
+              paths:
+              - path: /
+                pathType: Prefix
+                backend:
+                  service:
+                    name: {{ os_name }}-dashboards
+                    port:
+                      number: 5601
+        YAMEOF
+      register: os_ingress
+      changed_when: "'created' in os_ingress.stdout or 'configured' in os_ingress.stdout"
+
+    # ---------------------------------------------------------------
+    # STEP 4. CoreDNS에 dashboard.miso.local 등록
+    # ---------------------------------------------------------------
+    - name: "4-a. dashboard.miso.local 등록 여부 확인"
+      ansible.builtin.shell: |
+        kubectl get configmap coredns -n kube-system \
+          -o jsonpath='{.data.Corefile}' | grep -c "dashboard.miso.local" || true
+      register: dashboard_dns_check
+      changed_when: false
+
+    - name: "4-b. CoreDNS에 dashboard.miso.local 추가"
+      ansible.builtin.shell: |
+        kubectl get configmap coredns -n kube-system -o json | \
+        python3 -c "
+        import json, sys
+        cm = json.load(sys.stdin)
+        corefile = cm['data']['Corefile']
+        entry = '      10.1.1.10 dashboard.miso.local\n'
+        corefile = corefile.replace(
+          '10.1.1.10 argocd.miso.local\n',
+          '10.1.1.10 argocd.miso.local\n' + entry
+        )
+        cm['data']['Corefile'] = corefile
+        print(json.dumps(cm))
+        " | kubectl apply -f -
+      when: dashboard_dns_check.stdout == "0"
+      register: dns_update
+
+    - name: "4-c. CoreDNS 재시작"
+      ansible.builtin.shell: |
+        kubectl rollout restart deployment coredns -n kube-system
+        kubectl rollout status deployment coredns -n kube-system --timeout=60s
+      when: dns_update is changed
+      changed_when: true
+
+    # ---------------------------------------------------------------
+    # STEP 5. CA 인증서를 전체 K8s 노드에 배포
+    # (containerd, curl 등이 신뢰하도록)
+    # ---------------------------------------------------------------
+    - name: "5. CA 인증서를 K8s 노드 시스템 신뢰 저장소에 추가"
+      ansible.builtin.copy:
+        src: "{{ ca_cert }}"
+        dest: /usr/local/share/ca-certificates/miso-root-ca.crt
+        mode: "0644"
+      become: yes
+      delegate_to: "{{ item }}"
+      loop: "{{ groups['k8s'] | list }}"
+
+    - name: "5-b. 시스템 CA 신뢰 저장소 업데이트"
+      ansible.builtin.shell: update-ca-certificates
+      become: yes
+      delegate_to: "{{ item }}"
+      loop: "{{ groups['k8s'] | list }}"
+      changed_when: true
+
+    # ---------------------------------------------------------------
+    # STEP 6. Harbor 인증서 교체
+    # (Harbor VM에서 직접 처리)
+    # ---------------------------------------------------------------
+    - name: "6. Harbor 인증서 교체 및 재시작"
+      ansible.builtin.shell: |
+        cp {{ playbook_dir }}/tls.crt /etc/harbor/certs/harbor.crt
+        cp {{ playbook_dir }}/tls.key /etc/harbor/certs/harbor.key
+        cp {{ playbook_dir }}/ca.crt \
+          /usr/local/share/ca-certificates/miso-root-ca.crt
+        update-ca-certificates
+        cd /opt/harbor && docker compose down && docker compose up -d
+      become: yes
+      delegate_to: "{{ groups['harbor'][0] }}"
+      changed_when: true
+
+    - name: "6-b. Harbor 기동 대기"
+      ansible.builtin.uri:
+        url: "https://harbor.miso.local/api/v2.0/health"
+        validate_certs: no
+        status_code: 200
+      register: harbor_health
+      until: harbor_health.status == 200
+      retries: 30
+      delay: 10
+      delegate_to: "{{ groups['harbor'][0] }}"
+
+    # ---------------------------------------------------------------
+    # STEP 7. Grafana nginx reverse proxy + TLS 설정
+    # (monitor VM에서 직접 처리)
+    # ---------------------------------------------------------------
+    - name: "7-a. nginx 설치 (monitor VM)"
+      ansible.builtin.apt:
+        name: nginx
+        state: present
+        update_cache: yes
+      become: yes
+      delegate_to: "{{ groups['monitoring'][0] }}"
+
+    - name: "7-b. nginx certs 디렉토리 생성"
+      ansible.builtin.file:
+        path: /etc/nginx/certs
+        state: directory
+        mode: "0750"
+        owner: root
+        group: www-data
+      become: yes
+      delegate_to: "{{ groups['monitoring'][0] }}"
+
+    - name: "7-c. 인증서 파일 복사 (monitor VM)"
+      ansible.builtin.copy:
+        src: "{{ item.src }}"
+        dest: "{{ item.dest }}"
+        mode: "0640"
+        owner: root
+        group: www-data
+      become: yes
+      delegate_to: "{{ groups['monitoring'][0] }}"
+      loop:
+        - { src: "{{ tls_cert }}", dest: "/etc/nginx/certs/tls.crt" }
+        - { src: "{{ tls_key }}",  dest: "/etc/nginx/certs/tls.key" }
+        - { src: "{{ ca_cert }}",  dest: "/usr/local/share/ca-certificates/miso-root-ca.crt" }
+
+    - name: "7-d. Grafana nginx 설정 배포"
+      ansible.builtin.copy:
+        dest: /etc/nginx/sites-available/monitoring
+        mode: "0644"
+        content: |
+          # HTTP → HTTPS redirect
+          server {
+              listen 80;
+              server_name monitor.miso.local;
+              return 301 https://$host$request_uri;
+          }
+
+          # HTTPS reverse proxy → Grafana (localhost:3000)
+          server {
+              listen 443 ssl;
+              server_name monitor.miso.local;
+
+              ssl_certificate     /etc/nginx/certs/tls.crt;
+              ssl_certificate_key /etc/nginx/certs/tls.key;
+              ssl_protocols       TLSv1.2 TLSv1.3;
+              ssl_ciphers         HIGH:!aNULL:!MD5;
+
+              location / {
+                  proxy_pass         http://localhost:3000;
+                  proxy_set_header   Host $host;
+                  proxy_set_header   X-Real-IP $remote_addr;
+                  proxy_set_header   X-Forwarded-For $proxy_add_x_forwarded_for;
+                  proxy_set_header   X-Forwarded-Proto $scheme;
+              }
+          }
+
+          # HTTP → HTTPS redirect (prometheus)
+          server {
+              listen 80;
+              server_name prometheus.miso.local;
+              return 301 https://$host$request_uri;
+          }
+
+          # HTTPS reverse proxy → Prometheus (localhost:9090)
+          server {
+              listen 443 ssl;
+              server_name prometheus.miso.local;
+
+              ssl_certificate     /etc/nginx/certs/tls.crt;
+              ssl_certificate_key /etc/nginx/certs/tls.key;
+              ssl_protocols       TLSv1.2 TLSv1.3;
+              ssl_ciphers         HIGH:!aNULL:!MD5;
+
+              location / {
+                  proxy_pass         http://localhost:9090;
+                  proxy_set_header   Host $host;
+                  proxy_set_header   X-Real-IP $remote_addr;
+                  proxy_set_header   X-Forwarded-For $proxy_add_x_forwarded_for;
+                  proxy_set_header   X-Forwarded-Proto $scheme;
+              }
+          }
+
+          # HTTP → HTTPS redirect (alertmanager)
+          server {
+              listen 80;
+              server_name alertmanager.miso.local;
+              return 301 https://$host$request_uri;
+          }
+
+          # HTTPS reverse proxy → AlertManager (localhost:9093)
+          server {
+              listen 443 ssl;
+              server_name alertmanager.miso.local;
+
+              ssl_certificate     /etc/nginx/certs/tls.crt;
+              ssl_certificate_key /etc/nginx/certs/tls.key;
+              ssl_protocols       TLSv1.2 TLSv1.3;
+              ssl_ciphers         HIGH:!aNULL:!MD5;
+
+              location / {
+                  proxy_pass         http://localhost:9093;
+                  proxy_set_header   Host $host;
+                  proxy_set_header   X-Real-IP $remote_addr;
+                  proxy_set_header   X-Forwarded-For $proxy_add_x_forwarded_for;
+                  proxy_set_header   X-Forwarded-Proto $scheme;
+              }
+          }
+      become: yes
+      delegate_to: "{{ groups['monitoring'][0] }}"
+      notify: Reload nginx
+
+    - name: "7-e. nginx sites-enabled 심볼릭 링크"
+      ansible.builtin.file:
+        src: /etc/nginx/sites-available/monitoring
+        dest: /etc/nginx/sites-enabled/monitoring
+        state: link
+      become: yes
+      delegate_to: "{{ groups['monitoring'][0] }}"
+      notify: Reload nginx
+
+    - name: "7-f. default nginx site 비활성화"
+      ansible.builtin.file:
+        path: /etc/nginx/sites-enabled/default
+        state: absent
+      become: yes
+      delegate_to: "{{ groups['monitoring'][0] }}"
+      notify: Reload nginx
+
+    - name: "7-g. CA 신뢰 저장소 업데이트 (monitor VM)"
+      ansible.builtin.shell: update-ca-certificates
+      become: yes
+      delegate_to: "{{ groups['monitoring'][0] }}"
+      changed_when: true
+
+    # ---------------------------------------------------------------
+    # 완료 안내
+    # ---------------------------------------------------------------
+    - name: "완료 안내"
+      ansible.builtin.debug:
+        msg:
+          - "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          - " SSL 적용 완료"
+          - "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          - " https://harbor.miso.local      (Harbor)"
+          - " https://argocd.miso.local      (ArgoCD)"
+          - " https://monitor.miso.local        (Grafana)"
+          - " https://prometheus.miso.local     (Prometheus)"
+          - " https://alertmanager.miso.local   (AlertManager)"
+          - " https://dashboard.miso.local   (OpenSearch Dashboards)"
+          - ""
+          - " ※ 접속 PC에 CA 인증서(ca.crt) 설치 필요"
+          - "   Windows: 00_install_ca_windows.bat (관리자 권한)"
+          - "   macOS  : bash 00_install_ca_macos.sh"
+          - "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+  handlers:
+    - name: Reload nginx
+      ansible.builtin.systemd:
+        name: nginx
+        state: restarted
+        enabled: yes
+      become: yes
+      delegate_to: "{{ groups['monitoring'][0] }}"
+
+# ---------------------------------------------------------------
+# STEP 8. MinIO Console Ingress - wildcard Secret으로 교체
+# (cert-manager internal-ca-issuer → miso-wildcard-tls)
+# ---------------------------------------------------------------
+- name: "MinIO Console Ingress TLS 교체"
+  hosts: bastion
+  become: no
+  gather_facts: false
+  environment:
+    KUBECONFIG: "{{ lookup('env', 'HOME') }}/.kube/config"
+  vars:
+    wildcard_secret: "miso-wildcard-tls"
+    minio_namespace: "default"
+    minio_console_host: "s3console.miso.local"
+    minio_console_allowed_cidrs: "0.0.0.0/0"
+
+  tasks:
+    - name: "8. MinIO Console wildcard Secret 등록"
+      ansible.builtin.shell: |
+        kubectl create secret tls {{ wildcard_secret }} \
+          --cert={{ playbook_dir }}/tls.crt \
+          --key={{ playbook_dir }}/tls.key \
+          -n {{ minio_namespace }} \
+          --dry-run=client -o yaml | kubectl apply -f -
+      changed_when: true
+
+    - name: "8-b. MinIO Console Ingress TLS 교체 (cert-manager → wildcard)"
+      ansible.builtin.shell: |
+        kubectl apply -f - << 'YAMEOF'
+        apiVersion: networking.k8s.io/v1
+        kind: Ingress
+        metadata:
+          name: minio-ingress
+          namespace: {{ minio_namespace }}
+          annotations:
+            kubernetes.io/ingress.class: nginx
+            nginx.ingress.kubernetes.io/proxy-body-size: "0"
+            nginx.ingress.kubernetes.io/force-ssl-redirect: "true"
+            nginx.ingress.kubernetes.io/whitelist-source-range: "{{ minio_console_allowed_cidrs }}"
+        spec:
+          tls:
+          - hosts:
+            - {{ minio_console_host }}
+            secretName: {{ wildcard_secret }}
+          rules:
+          - host: {{ minio_console_host }}
+            http:
+              paths:
+              - path: /
+                pathType: Prefix
+                backend:
+                  service:
+                    name: minio
+                    port:
+                      number: 9001
+        YAMEOF
+      register: minio_ingress
+      changed_when: "'created' in minio_ingress.stdout or 'configured' in minio_ingress.stdout"

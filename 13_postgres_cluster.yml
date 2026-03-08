@@ -1,0 +1,232 @@
+---
+- name: "Create CNPG PostgreSQL HA Cluster (pgvector image, default namespace)"
+  hosts: bastion
+  become: no
+  environment:
+    KUBECONFIG: "{{ lookup('env', 'HOME') }}/.kube/config"
+  vars:
+    cluster_name: "miso-db"
+    storage_class: "local-path"
+    storage_size: "30Gi"          # 최초 설치 시 신중히 결정 (변경 불가)
+
+    db_name: "miso"
+    db_owner: "miso_admin"
+
+    pg_action: "install"          # install / remove (PVC 보존) / purge (완전 삭제)
+
+    # CNPG 기본 이미지 (pgvector/uuid-ossp 포함 확인됨)
+    postgres_image: "harbor.miso.local/miso/postgres:16"
+
+    # Pod CIDR (03_k8s_masters.yml 의 pod_cidr 과 일치시킬 것)
+    pod_cidr: "10.244.0.0/16"
+
+    # DB 노드 taint/label 정책
+    db_node_label_key: "node-role.kubernetes.io/db"
+    db_node_label_value: "true"
+    db_node_taint_key: "dedicated"
+    db_node_taint_value: "db"
+
+  tasks:
+    # -----------------------------------------------------------------
+    # STEP 0. 제거 모드
+    #   remove : CNPG Cluster 리소스만 제거, PVC 보존 (데이터 유지)
+    #   purge  : CNPG Cluster + PVC 모두 제거 (데이터 완전 삭제)
+    # -----------------------------------------------------------------
+    - name: "0. [remove] CNPG Cluster 제거 (PVC 보존)"
+      ansible.builtin.shell: |
+        kubectl delete cluster {{ cluster_name }} -n default --ignore-not-found=true
+        for i in $(seq 1 30); do
+          COUNT=$(kubectl get pods -l cnpg.io/cluster={{ cluster_name }} \
+            --no-headers 2>/dev/null | wc -l)
+          [ "$COUNT" -eq 0 ] && echo "Pod 종료 완료" && break
+          echo "대기 중... (${COUNT}개 남음)"
+          sleep 5
+        done
+        echo "제거 완료 (PVC 보존)"
+        kubectl get pvc -n default | grep {{ cluster_name }} || echo "  PVC 없음"
+      when: pg_action == 'remove'
+      register: remove_out
+      changed_when: true
+
+    - name: "0. [remove] 제거 결과"
+      ansible.builtin.debug:
+        msg: "{{ remove_out.stdout_lines | default([]) }}"
+      when: pg_action == 'remove'
+
+    - name: "0. [purge] CNPG Cluster + PVC 완전 삭제"
+      ansible.builtin.shell: |
+        kubectl delete cluster {{ cluster_name }} -n default --ignore-not-found=true
+        for i in $(seq 1 30); do
+          COUNT=$(kubectl get pods -l cnpg.io/cluster={{ cluster_name }} \
+            --no-headers 2>/dev/null | wc -l)
+          [ "$COUNT" -eq 0 ] && echo "Pod 종료 완료" && break
+          echo "대기 중... (${COUNT}개 남음)"
+          sleep 5
+        done
+        kubectl delete pvc -n default \
+          -l cnpg.io/cluster={{ cluster_name }} --ignore-not-found=true
+        echo "완전 삭제 완료"
+      when: pg_action == 'purge'
+      register: purge_out
+      changed_when: true
+
+    - name: "0. [purge] 완전 삭제 결과"
+      ansible.builtin.debug:
+        msg: "{{ purge_out.stdout_lines | default([]) }}"
+      when: pg_action == 'purge'
+
+    - name: "0. 제거/삭제 완료 후 종료"
+      ansible.builtin.meta: end_play
+      when: pg_action in ['remove', 'purge']
+
+    # -----------------------------------------------------------------
+    # STEP 1. CNPG Cluster 생성/업데이트
+    # -----------------------------------------------------------------
+    - name: "CNPG Cluster manifest 생성 (/tmp/miso-cluster.yaml)"
+      ansible.builtin.copy:
+        dest: /tmp/miso-cluster.yaml
+        mode: "0644"
+        content: |
+          apiVersion: postgresql.cnpg.io/v1
+          kind: Cluster
+          metadata:
+            name: {{ cluster_name }}
+            namespace: default
+          spec:
+            instances: 3
+
+            imageName: {{ postgres_image }}
+
+            imagePullSecrets:
+              - name: harbor-registry-secret
+
+            storage:
+              size: {{ storage_size }}
+              storageClass: {{ storage_class }}
+
+            description: "MISO HA Cluster (CNPG + pgvector)"
+
+            postgresql:
+              parameters:
+                max_connections: "100"
+                shared_buffers: "512MB"
+                effective_cache_size: "1536MB"
+                work_mem: "8MB"
+              pg_hba:
+                - host all all {{ pod_cidr }} md5
+
+            bootstrap:
+              initdb:
+                database: {{ db_name }}
+                owner: {{ db_owner }}
+                postInitApplicationSQL:
+                  - CREATE EXTENSION IF NOT EXISTS vector;
+                  - CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
+
+            affinity:
+              nodeAffinity:
+                requiredDuringSchedulingIgnoredDuringExecution:
+                  nodeSelectorTerms:
+                    - matchExpressions:
+                        - key: {{ db_node_label_key }}
+                          operator: In
+                          values:
+                            - "{{ db_node_label_value }}"
+
+              tolerations:
+                - key: "{{ db_node_taint_key }}"
+                  operator: "Equal"
+                  value: "{{ db_node_taint_value }}"
+                  effect: "NoSchedule"
+
+    - name: "CNPG Cluster manifest 적용"
+      ansible.builtin.command: kubectl apply -f /tmp/miso-cluster.yaml
+      register: cluster_apply
+      changed_when: >
+        'created' in cluster_apply.stdout or
+        'configured' in cluster_apply.stdout
+
+    - name: "Apply 결과 출력"
+      ansible.builtin.debug:
+        msg: "{{ cluster_apply.stdout_lines }}"
+
+    - name: "Cluster 서비스 3종(rw/ro/r) 생성 대기"
+      ansible.builtin.shell: |
+        set -e
+        kubectl get svc | grep -q "{{ cluster_name }}-rw" && \
+        kubectl get svc | grep -q "{{ cluster_name }}-ro" && \
+        kubectl get svc | grep -q "{{ cluster_name }}-r"
+      register: svc_wait
+      retries: 60
+      delay: 5
+      until: svc_wait.rc == 0
+      changed_when: false
+
+    - name: "Cluster Pod 생성 시작 대기"
+      ansible.builtin.shell: |
+        kubectl get pods -l cnpg.io/cluster={{ cluster_name }} \
+          --no-headers 2>/dev/null | wc -l
+      register: pod_count
+      until: pod_count.stdout | trim | int >= 1
+      retries: 60
+      delay: 5
+      changed_when: false
+
+    - name: "Cluster Pod Ready 대기 (3/3)"
+      ansible.builtin.shell: |
+        kubectl wait pod \
+          -l cnpg.io/cluster={{ cluster_name }} \
+          --for=condition=Ready \
+          --timeout=600s
+      changed_when: false
+
+    - name: "최종 상태 확인"
+      ansible.builtin.shell: |
+        echo "=== Pods ==="
+        kubectl get pods -l cnpg.io/cluster={{ cluster_name }} -o wide
+        echo ""
+        echo "=== Services ==="
+        kubectl get svc | grep {{ cluster_name }}
+        echo ""
+        echo "=== Cluster Status ==="
+        kubectl get cluster {{ cluster_name }}
+      register: final_out
+      changed_when: false
+
+    - name: "최종 상태 출력"
+      ansible.builtin.debug:
+        msg: "{{ final_out.stdout_lines }}"
+
+    - name: "임시 manifest 파일 정리"
+      ansible.builtin.file:
+        path: /tmp/miso-cluster.yaml
+        state: absent
+
+    # -----------------------------------------------------------------
+    # 완료 안내
+    # -----------------------------------------------------------------
+    - name: "[ 완료 안내 ]"
+      ansible.builtin.debug:
+        msg:
+          - "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          - " PostgreSQL HA 클러스터 설치 완료"
+          - "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          - ""
+          - " [구성]"
+          - "  Primary 1 + Replica 2 / Storage: {{ storage_size }}"
+          - "  Image: {{ postgres_image }}"
+          - "  Extensions: vector, uuid-ossp"
+          - ""
+          - " [내부 접속 (앱에서)]"
+          - "  RW : postgres-rw.miso.local:5432"
+          - "  RO : postgres-ro.miso.local:5432"
+          - "  또는: {{ cluster_name }}-rw:5432 / {{ cluster_name }}-ro:5432"
+          - ""
+          - " [자격증명 확인]"
+          - "  kubectl get secret {{ cluster_name }}-app"
+          - "    -o jsonpath='{.data.password}' | base64 -d"
+          - ""
+          - " [주의]"
+          - "  storage_size는 최초 설치 시에만 적용됩니다."
+          - "  기존 PVC 용량 변경은 purge 후 재설치가 필요합니다."
+          - "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"

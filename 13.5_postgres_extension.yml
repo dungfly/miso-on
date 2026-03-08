@@ -1,0 +1,113 @@
+---
+# =================================================================
+# 13_5_postgres_extension.yml
+#
+# 목적: PostgreSQL 확장 기능 활성화 (vector, uuid-ossp)
+#
+# 참고:
+#   13_postgres_cluster.yml의 postInitApplicationSQL로
+#   클러스터 생성 시 자동 설치됨.
+#   아래 경우에 수동으로 실행:
+#     - 기존 클러스터에 확장 기능 추가 시
+#     - 새 데이터베이스 생성 후 확장 기능 활성화 시
+#     - postInitApplicationSQL 없이 설치한 클러스터 보정 시
+#
+# 선행 조건:
+#   - 13_postgres_cluster.yml 실행 완료
+# =================================================================
+
+- name: "Enable PostgreSQL extensions (vector, uuid-ossp)"
+  hosts: bastion
+  become: no
+  environment:
+    KUBECONFIG: "{{ lookup('env', 'HOME') }}/.kube/config"
+  gather_facts: false
+  vars:
+    cluster_name: "miso-db"
+    db_name: "miso"
+
+  tasks:
+    # -----------------------------------------------------------------
+    # STEP 0. 클러스터 완전 준비 대기 (instances 3/3 Ready)
+    # -----------------------------------------------------------------
+    - name: "0. CNPG 클러스터 Ready 대기 (최대 10분)"
+      ansible.builtin.shell: |
+        for i in $(seq 1 60); do
+          READY=$(kubectl get cluster {{ cluster_name }} \
+            -o jsonpath='{.status.readyInstances}' 2>/dev/null || echo 0)
+          INSTANCES=$(kubectl get cluster {{ cluster_name }} \
+            -o jsonpath='{.spec.instances}' 2>/dev/null || echo 3)
+          echo "Ready: ${READY} / ${INSTANCES} ($i/60)"
+          if [ "$READY" = "$INSTANCES" ]; then
+            echo "클러스터 준비 완료"
+            exit 0
+          fi
+          sleep 10
+        done
+        echo "타임아웃 - 강제 진행"
+        exit 1
+      register: cluster_wait
+      changed_when: false
+
+    - name: "0. 대기 결과 출력"
+      ansible.builtin.debug:
+        msg: "{{ cluster_wait.stdout_lines }}"
+
+    # -----------------------------------------------------------------
+    # STEP 1. Primary Pod 이름 확인
+    # -----------------------------------------------------------------
+    - name: "1. Primary Pod 이름 확인"
+      ansible.builtin.shell: |
+        kubectl get pods \
+          -l cnpg.io/cluster={{ cluster_name }},cnpg.io/instanceRole=primary \
+          -o jsonpath='{.items[0].metadata.name}'
+      register: pod_name
+      changed_when: false
+
+    - name: "1. Primary Pod 이름 출력"
+      ansible.builtin.debug:
+        msg: "Primary Pod: {{ pod_name.stdout }}"
+
+    # -----------------------------------------------------------------
+    # STEP 2. 확장 기능 활성화
+    #   - -it 제거: Ansible/CI 환경에서 tty 없어도 동작
+    #   - IF NOT EXISTS: 멱등성 보장
+    # -----------------------------------------------------------------
+    - name: "2. pgvector 확장 활성화"
+      ansible.builtin.shell: |
+        kubectl exec {{ pod_name.stdout }} \
+          -- psql -U postgres -d {{ db_name }} \
+          -c "CREATE EXTENSION IF NOT EXISTS vector;"
+      register: vec_out
+      changed_when: "'CREATE EXTENSION' in vec_out.stdout"
+
+    - name: "2. pgvector 결과 출력"
+      ansible.builtin.debug:
+        msg: "{{ vec_out.stdout_lines }}"
+
+    - name: "3. uuid-ossp 확장 활성화"
+      ansible.builtin.shell: |
+        kubectl exec {{ pod_name.stdout }} \
+          -- psql -U postgres -d {{ db_name }} \
+          -c "CREATE EXTENSION IF NOT EXISTS \"uuid-ossp\";"
+      register: uuid_out
+      changed_when: "'CREATE EXTENSION' in uuid_out.stdout"
+
+    - name: "3. uuid-ossp 결과 출력"
+      ansible.builtin.debug:
+        msg: "{{ uuid_out.stdout_lines }}"
+
+    # -----------------------------------------------------------------
+    # STEP 3. 설치된 확장 기능 목록 확인
+    # -----------------------------------------------------------------
+    - name: "4. 설치된 확장 기능 목록 확인"
+      ansible.builtin.shell: |
+        kubectl exec {{ pod_name.stdout }} \
+          -- psql -U postgres -d {{ db_name }} \
+          -c "\dx"
+      register: dx_out
+      changed_when: false
+
+    - name: "4. 확장 기능 목록 출력"
+      ansible.builtin.debug:
+        msg: "{{ dx_out.stdout_lines }}"

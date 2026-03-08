@@ -1,0 +1,100 @@
+global
+    log /dev/log local0
+    log /dev/log local1 notice
+    chroot /var/lib/haproxy
+    stats socket /run/haproxy/admin.sock mode 660 level admin
+    user haproxy
+    group haproxy
+    daemon
+
+defaults
+    log     global
+    option  httplog
+    timeout connect 5000
+    timeout client  50000
+    timeout server  50000
+
+# =========================================================
+# [Frontend] Kubernetes API (Control Plane) :6443 (TCP)
+# =========================================================
+frontend k8s-api
+    {% if bind_vip | default(false) %}
+    bind {{ vip_ip }}:6443
+    {% else %}
+    bind *:6443
+    {% endif %}
+    mode tcp
+    option tcplog
+    default_backend k8s-masters
+
+backend k8s-masters
+    mode tcp
+    balance roundrobin
+    option tcp-check
+    {% for node in master_nodes %}
+    server {{ node.name }} {{ node.ip }}:6443 check
+    {% endfor %}
+
+# =========================================================
+# [Frontend] Ingress HTTP :80 -> worker NodePort 30080
+# monitor.miso.local HTTP → HTTPS redirect 포함
+# =========================================================
+frontend k8s-ingress-http
+    {% if bind_vip | default(false) %}
+    bind {{ vip_ip }}:80
+    {% else %}
+    bind *:80
+    {% endif %}
+    mode http
+    option httplog
+
+    # monitor.miso.local → HTTPS redirect
+    acl is_monitor hdr(host) -i monitor.miso.local
+    redirect scheme https code 301 if is_monitor
+
+    default_backend k8s-workers-http
+
+backend k8s-workers-http
+    mode http
+    balance roundrobin
+    {% for node in worker_nodes %}
+    server {{ node.name }} {{ node.ip }}:{{ ingress_http_nodeport }} check
+    {% endfor %}
+
+# =========================================================
+# [Frontend] HTTPS :443 - SNI 기반 라우팅 (TCP)
+#   monitor.miso.local → Grafana VM (10.1.5.100:443)
+#   그 외 모든 도메인  → K8s Ingress-nginx NodePort 30443
+# =========================================================
+frontend https-in
+    {% if bind_vip | default(false) %}
+    bind {{ vip_ip }}:443
+    {% else %}
+    bind *:443
+    {% endif %}
+    mode tcp
+    option tcplog
+
+    # SNI 검사 (TLS ClientHello에서 hostname 추출)
+    tcp-request inspect-delay 5s
+    tcp-request content accept if { req_ssl_hello_type 1 }
+
+    # monitor.miso.local → Grafana VM
+    acl is_monitor req_ssl_sni -i monitor.miso.local
+    use_backend grafana-https if is_monitor
+
+    # 그 외 → K8s Ingress
+    default_backend k8s-workers-https
+
+backend k8s-workers-https
+    mode tcp
+    balance roundrobin
+    {% for node in worker_nodes %}
+    server {{ node.name }} {{ node.ip }}:{{ ingress_https_nodeport }} check
+    {% endfor %}
+
+# Grafana (monitor VM) 직접 라우팅
+backend grafana-https
+    mode tcp
+    option tcp-check
+    server monitor1 {{ monitor_ip }}:443 check

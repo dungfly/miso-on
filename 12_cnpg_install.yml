@@ -1,0 +1,86 @@
+---
+- name: "Install CloudNativePG (CNPG) operator (offline-first)"
+  hosts: bastion
+  become: no
+  environment:
+    KUBECONFIG: "{{ lookup('env', 'HOME') }}/.kube/config"
+  gather_facts: false
+  vars:
+    cnpg_manifest_src: "./cnpg-1.22.1.yaml"     # 컨트롤 머신(레포)에 있는 파일
+    cnpg_manifest_dest: "/tmp/cnpg-1.22.1.yaml" # bastion에 둘 위치
+
+    allow_online_download: true
+    cnpg_manifest_url: "http://10.1.5.10:8080/manifests/cnpg-1.22.1.yaml"
+
+  tasks:
+    - name: "Check CNPG manifest exists on controller (repo file)"
+      ansible.builtin.stat:
+        path: "{{ cnpg_manifest_src }}"
+      delegate_to: localhost
+      run_once: true
+      register: cnpg_local
+      changed_when: false
+
+    - name: "Copy CNPG manifest to bastion (offline mode)"
+      ansible.builtin.copy:
+        src: "{{ cnpg_manifest_src }}"
+        dest: "{{ cnpg_manifest_dest }}"
+        mode: "0644"
+      when: cnpg_local.stat.exists
+
+    - name: "Download CNPG manifest to bastion (online mode - optional)"
+      ansible.builtin.get_url:
+        url: "{{ cnpg_manifest_url }}"
+        dest: "{{ cnpg_manifest_dest }}"
+        mode: "0644"
+      when: (not cnpg_local.stat.exists) and allow_online_download
+
+    - name: "Fail if CNPG manifest not available (offline and no local file)"
+      ansible.builtin.fail:
+        msg: >
+          CNPG manifest not found on controller: {{ cnpg_manifest_src }}
+          and online download is disabled/unavailable.
+      when: (not cnpg_local.stat.exists) and (not allow_online_download)
+
+    - name: "Apply CNPG operator manifest (server-side)"
+      ansible.builtin.shell: |
+        set -e
+        kubectl apply --server-side --force-conflicts -f {{ cnpg_manifest_dest }} 2>&1
+      register: apply_out
+      changed_when: >
+        'created' in apply_out.stdout or
+        'configured' in apply_out.stdout or
+        'created' in apply_out.stderr or
+        'configured' in apply_out.stderr
+
+    - name: "Apply 결과 출력"
+      ansible.builtin.debug:
+        msg: "{{ (apply_out.stdout_lines | default([])) + (apply_out.stderr_lines | default([])) }}"
+
+    - name: "CNPG controller-manager rollout 완료 대기"
+      ansible.builtin.shell: |
+        set -e
+        kubectl -n cnpg-system rollout status deploy/cnpg-controller-manager --timeout=300s
+      changed_when: false
+
+    - name: "CNPG Pod Ready 대기"
+      ansible.builtin.shell: |
+        set -e
+        kubectl wait -n cnpg-system \
+          --for=condition=Ready pod \
+          -l app.kubernetes.io/name=cloudnative-pg \
+          --timeout=300s
+      changed_when: false
+
+    - name: "Webhook 안정화 추가 대기 (15초)"
+      ansible.builtin.pause:
+        seconds: 15
+
+    - name: "Show CNPG pods"
+      ansible.builtin.command: kubectl get pods -n cnpg-system -o wide
+      register: pods_out
+      changed_when: false
+
+    - name: "Print CNPG pods"
+      ansible.builtin.debug:
+        msg: "{{ pods_out.stdout_lines }}"

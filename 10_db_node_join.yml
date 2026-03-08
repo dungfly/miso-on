@@ -1,0 +1,143 @@
+---
+- name: Install Kubernetes runtime + tools on DB nodes (as worker)
+  hosts: db_nodes
+  become: yes
+  tasks:
+    - name: Load kernel modules for Kubernetes
+      ansible.builtin.command: modprobe {{ item }}
+      loop:
+        - overlay
+        - br_netfilter
+
+    - name: Set sysctl params
+      ansible.builtin.command: sysctl -w {{ item.key }}={{ item.value }}
+      loop:
+        - { key: 'net.bridge.bridge-nf-call-iptables', value: '1' }
+        - { key: 'net.bridge.bridge-nf-call-ip6tables', value: '1' }
+        - { key: 'net.ipv4.ip_forward', value: '1' }
+
+    - name: Install containerd
+      ansible.builtin.apt:
+        name: containerd
+        state: present
+        update_cache: yes
+
+    - name: Generate containerd config and enable systemd cgroup
+      ansible.builtin.shell: |
+        set -e
+        mkdir -p /etc/containerd
+        containerd config default > /etc/containerd/config.toml
+        sed -i 's/SystemdCgroup = false/SystemdCgroup = true/g' /etc/containerd/config.toml
+      args:
+        creates: /etc/containerd/config.toml
+
+    - name: Restart and enable containerd
+      ansible.builtin.systemd:
+        name: containerd
+        state: restarted
+        enabled: yes
+        daemon_reload: yes
+
+    - name: Add Kubernetes apt key
+      ansible.builtin.get_url:
+        url: https://pkgs.k8s.io/core:/stable:/v1.30/deb/Release.key
+        dest: /etc/apt/keyrings/kubernetes-apt-keyring.asc
+        mode: '0644'
+
+    - name: Add Kubernetes apt repo
+      ansible.builtin.copy:
+        dest: /etc/apt/sources.list.d/kubernetes.list
+        mode: '0644'
+        content: |
+          deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.asc] https://pkgs.k8s.io/core:/stable:/v1.30/deb/ /
+
+    - name: Install kubelet/kubeadm/kubectl
+      ansible.builtin.apt:
+        name:
+          - kubelet
+          - kubeadm
+          - kubectl
+        state: present
+        update_cache: yes
+
+    - name: Hold kube packages
+      ansible.builtin.dpkg_selections:
+        name: "{{ item }}"
+        selection: hold
+      loop: [kubelet, kubeadm, kubectl]
+
+
+
+# ------------------------------------------------------------------
+
+- name: Get kubeadm join command from control plane
+  hosts: masters[0]
+  become: yes
+  gather_facts: false
+  tasks:
+    - name: Generate join command (token + discovery hash)
+      ansible.builtin.command: kubeadm token create --print-join-command
+      register: join_cmd
+      changed_when: false
+
+    - name: Save join command for other plays
+      ansible.builtin.set_fact:
+        kubeadm_join_cmd: "{{ join_cmd.stdout }}"
+
+# ------------------------------------------------------------------
+
+- name: Join DB nodes
+  hosts: db_nodes
+  become: yes
+  gather_facts: false
+  tasks:
+    - name: Join node if not already joined
+      ansible.builtin.shell: |
+        set -e
+        if [ -f /etc/kubernetes/kubelet.conf ]; then
+          echo "Already joined - skip"
+          exit 0
+        fi
+        {{ hostvars[groups['masters'][0]].kubeadm_join_cmd }} --ignore-preflight-errors=all
+
+# ------------------------------------------------------------------
+
+- name: Label/Taint DB nodes (by InternalIP)
+  hosts: bastion
+  become: no
+  gather_facts: false
+  vars:
+    # Jinja2로 미리 IP 목록 생성 (shell for 루프와 혼용 방지)
+    db_node_ips: "{{ groups['db_nodes'] | map('extract', hostvars, 'ansible_host') | list }}"
+  tasks:
+    - name: Wait until DB nodes appear in cluster (by InternalIP)
+      ansible.builtin.shell: |
+        set -e
+        for ip in {{ db_node_ips | join(' ') }}; do
+          kubectl get nodes -o wide | awk -v ip="$ip" '$6==ip {found=1} END{exit !found}'
+        done
+      register: node_wait
+      retries: 60
+      delay: 5
+      until: node_wait.rc == 0
+      changed_when: false
+
+    - name: Label/Taint DB nodes (by InternalIP)
+      ansible.builtin.shell: |
+        set -e
+        for ip in {{ db_node_ips | join(' ') }}; do
+          node="$(kubectl get nodes -o wide | awk -v ip="$ip" '$6==ip {print $1; exit}')"
+          echo "map: $ip -> $node"
+          kubectl label node "$node" node-role.kubernetes.io/db=true --overwrite
+          kubectl taint node "$node" dedicated=db:NoSchedule --overwrite
+        done
+      changed_when: true
+
+    - name: Show nodes
+      ansible.builtin.command: kubectl get nodes -o wide
+      register: nodes_out
+      changed_when: false
+
+    - name: Print nodes
+      ansible.builtin.debug:
+        msg: "{{ nodes_out.stdout_lines }}"

@@ -1,0 +1,168 @@
+---
+# =================================================================
+# A4_local_repo_setup.yml - 로컬 apt 저장소 등록 (폐쇄망 대비)
+#
+# [실행 타이밍] phase1 실행 전 (01_common_setup.yml 보다 먼저)
+#               즉 reboot_all.yml 직전에 실행
+#
+# 실행: ansible-playbook -i ../hosts.ini A4_local_repo_setup.yml
+#
+# 동작:
+#   - 외부 apt 저장소를 모두 비활성화
+#   - Harbor 서버(10.1.5.10:8080)의 로컬 저장소 등록
+#   - 그룹별로 필요한 저장소만 등록
+#     common → 전체 노드
+#     k8s    → masters, workers, db_nodes
+#     docker → harbor, monitoring
+#     haproxy→ lb
+# =================================================================
+
+# ---------------------------------------------------------------
+# PLAY 1. 외부 저장소 비활성화 + common 저장소 등록 (전체 노드)
+# ---------------------------------------------------------------
+- name: "로컬 apt 저장소 등록 - 전체 노드 (common)"
+  hosts: k8s:lb:monitoring  # harbor는 A1에서 직접 구성 - 제외
+  become: yes
+  gather_facts: false
+  vars:
+    mirror_base: "http://10.1.5.10:8080/debs"
+
+  tasks:
+    - name: "기존 외부 저장소 비활성화"
+      ansible.builtin.shell: |
+        # 기존 sources.list 백업 후 비활성화
+        if [ -f /etc/apt/sources.list ] && ! grep -q "^#.*DISABLED" /etc/apt/sources.list; then
+          cp /etc/apt/sources.list /etc/apt/sources.list.bak
+          sed -i 's/^deb /#deb /g' /etc/apt/sources.list
+          echo "비활성화 완료"
+        else
+          echo "이미 처리됨 - skip"
+        fi
+        # kubernetes, docker 등 외부 저장소 파일도 비활성화
+        for f in /etc/apt/sources.list.d/*.list; do
+          [ -f "$f" ] || continue
+          grep -q "miso.local\|10.1.5.10" "$f" && continue  # 로컬 저장소는 건드리지 않음
+          mv "$f" "${f}.bak" 2>/dev/null || true
+        done
+        echo "외부 저장소 비활성화 완료"
+      changed_when: true
+
+    - name: "common 로컬 저장소 등록"
+      ansible.builtin.copy:
+        dest: /etc/apt/sources.list.d/miso-local-common.list
+        mode: "0644"
+        content: |
+          deb [trusted=yes] {{ mirror_base }}/common ./
+
+    - name: "apt 캐시 갱신"
+      ansible.builtin.apt:
+        update_cache: yes
+
+# ---------------------------------------------------------------
+# PLAY 2. k8s 저장소 등록 (masters, workers, db_nodes)
+# ---------------------------------------------------------------
+- name: "로컬 apt 저장소 등록 - K8s 노드"
+  hosts: k8s
+  become: yes
+  gather_facts: false
+  vars:
+    mirror_base: "http://10.1.5.10:8080/debs"
+
+  tasks:
+    - name: "k8s 로컬 저장소 등록"
+      ansible.builtin.copy:
+        dest: /etc/apt/sources.list.d/miso-local-k8s.list
+        mode: "0644"
+        content: |
+          deb [trusted=yes] {{ mirror_base }}/k8s ./
+
+    - name: "apt 캐시 갱신"
+      ansible.builtin.apt:
+        update_cache: yes
+
+# ---------------------------------------------------------------
+# PLAY 3. monitoring 서버 - common + docker 저장소 등록
+# (harbor 서버는 A1_harbor_install.sh에서 직접 구성하므로 제외)
+# ---------------------------------------------------------------
+- name: "로컬 apt 저장소 등록 - Monitoring 서버 (monitor1)"
+  hosts: monitoring  # harbor 서버는 A1에서 직접 구성, monitoring만 대상
+  become: yes
+  gather_facts: false
+  vars:
+    mirror_base: "http://10.1.5.10:8080/debs"
+
+  tasks:
+    - name: "외부 저장소 비활성화"
+      ansible.builtin.shell: |
+        set -e
+        for f in /etc/apt/sources.list /etc/apt/sources.list.d/*.list; do
+          [ -f "$f" ] || continue
+          grep -q "miso.local\|10.1.5.10" "$f" && continue
+          sudo mv "$f" "${f}.disabled" 2>/dev/null || true
+        done
+      args:
+        executable: /bin/bash
+      changed_when: true
+
+    - name: "common 로컬 저장소 등록"
+      ansible.builtin.copy:
+        dest: /etc/apt/sources.list.d/miso-local-common.list
+        mode: "0644"
+        content: |
+          deb [trusted=yes] {{ mirror_base }}/common ./
+
+    - name: "docker 로컬 저장소 등록"
+      ansible.builtin.copy:
+        dest: /etc/apt/sources.list.d/miso-local-docker.list
+        mode: "0644"
+        content: |
+          deb [trusted=yes] {{ mirror_base }}/docker ./
+
+    - name: "apt 캐시 갱신"
+      ansible.builtin.apt:
+        update_cache: yes
+
+# ---------------------------------------------------------------
+# PLAY 4. haproxy 저장소 등록 (lb)
+# ---------------------------------------------------------------
+- name: "로컬 apt 저장소 등록 - LB 노드"
+  hosts: lb
+  become: yes
+  gather_facts: false
+  vars:
+    mirror_base: "http://10.1.5.10:8080/debs"
+
+  tasks:
+    - name: "haproxy 로컬 저장소 등록"
+      ansible.builtin.copy:
+        dest: /etc/apt/sources.list.d/miso-local-haproxy.list
+        mode: "0644"
+        content: |
+          deb [trusted=yes] {{ mirror_base }}/haproxy ./
+
+    - name: "apt 캐시 갱신"
+      ansible.builtin.apt:
+        update_cache: yes
+
+# ---------------------------------------------------------------
+# PLAY 5. 확인
+# ---------------------------------------------------------------
+- name: "저장소 등록 확인"
+  hosts: bastion
+  become: no
+  gather_facts: false
+  tasks:
+    - name: "완료 안내"
+      ansible.builtin.debug:
+        msg:
+          - "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          - " 로컬 apt 저장소 등록 완료"
+          - "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          - " common  → k8s, lb, monitoring"
+          - " k8s     → masters, workers, db_nodes"
+          - " docker  → monitoring (harbor는 A1에서 직접 구성)"
+          - " haproxy → lb"
+          - ""
+          - " 다음 단계:"
+          - "   ansible-playbook -i hosts.ini phase1_infra_base.yml"
+          - "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"

@@ -1,0 +1,210 @@
+---
+# =================================================================
+# 13_6_postgres_dns.yml
+#
+# 목적: PostgreSQL 도메인 접속을 위한 ExternalName Service 등록
+#
+#   postgres-rw.miso.local:5432  →  CNPG Primary  (읽기/쓰기)
+#   postgres-ro.miso.local:5432  →  CNPG Replica  (읽기 전용)
+#
+# 선행 조건:
+#   - 08_5_coredns_setup.yml 실행 완료 (miso.local 존 등록)
+#   - 13_postgres_cluster.yml 실행 완료 (CNPG 클러스터 생성)
+#
+# 이 플레이북의 역할:
+#   CoreDNS 존 등록은 08_5 에서 완료됨.
+#   여기서는 ExternalName Service 만 등록.
+#   → postgres-rw.miso.local → miso-db-rw.default.svc.cluster.local
+#   → postgres-ro.miso.local → miso-db-ro.default.svc.cluster.local
+#
+# [ExternalName 을 선택한 이유]
+#   CNPG는 Failover 시 miso-db-rw 서비스의 셀렉터를 자동으로
+#   새 Primary Pod 로 교체함.
+#   ExternalName 은 이 원본 서비스를 CNAME 으로 위임하므로
+#   Failover/Switchover 후에도 앱 DSN 변경 불필요.
+# =================================================================
+
+- name: "PostgreSQL ExternalName Service 등록 (도메인 접속)"
+  hosts: bastion
+  become: no
+  environment:
+    KUBECONFIG: "{{ lookup('env', 'HOME') }}/.kube/config"
+  vars:
+    cluster_name: "miso-db"
+    cluster_namespace: "default"
+    cnpg_rw_fqdn: "{{ cluster_name }}-rw.{{ cluster_namespace }}.svc.cluster.local"
+    cnpg_ro_fqdn: "{{ cluster_name }}-ro.{{ cluster_namespace }}.svc.cluster.local"
+
+  tasks:
+
+    # -----------------------------------------------------------------
+    # STEP 1. 선행 조건 확인
+    # -----------------------------------------------------------------
+    - name: "1. CoreDNS miso.local rewrite 규칙 등록 여부 확인 (08_5 선행 필수)"
+      ansible.builtin.shell: |
+        kubectl get configmap coredns -n kube-system \
+          -o jsonpath='{.data.Corefile}' \
+          | grep -q 'rewrite name exact postgres-rw.miso.local'
+      register: coredns_zone_check
+      changed_when: false
+      failed_when: coredns_zone_check.rc != 0
+
+    - name: "1. CNPG rw/ro/r 서비스 존재 확인 (13 선행 필수)"
+      ansible.builtin.shell: |
+        set -e
+        echo "=== CNPG 원본 서비스 ==="
+        kubectl get svc -n {{ cluster_namespace }} \
+          {{ cluster_name }}-rw \
+          {{ cluster_name }}-ro \
+          {{ cluster_name }}-r
+      register: cnpg_svc_check
+      changed_when: false
+
+    - name: "1. CNPG 서비스 확인 결과"
+      ansible.builtin.debug:
+        msg: "{{ cnpg_svc_check.stdout_lines }}"
+
+    # -----------------------------------------------------------------
+    # STEP 2. ExternalName Service 등록 (멱등성: kubectl apply)
+    # -----------------------------------------------------------------
+    - name: "2. ExternalName Service manifest 생성"
+      ansible.builtin.copy:
+        dest: /tmp/postgres-alias-svc.yaml
+        mode: "0644"
+        content: |
+          # [읽기/쓰기] postgres-rw.miso.local → CNPG Primary
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: postgres-rw
+            namespace: {{ cluster_namespace }}
+            labels:
+              app.kubernetes.io/managed-by: ansible
+              miso.local/role: postgres-rw
+            annotations:
+              miso.local/desc: "CNPG Primary alias - postgres-rw.miso.local"
+              miso.local/target: "{{ cnpg_rw_fqdn }}"
+          spec:
+            type: ExternalName
+            externalName: {{ cnpg_rw_fqdn }}
+            ports:
+              - name: postgres
+                port: 5432
+                targetPort: 5432
+                protocol: TCP
+          ---
+          # [읽기 전용] postgres-ro.miso.local → CNPG Replica
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: postgres-ro
+            namespace: {{ cluster_namespace }}
+            labels:
+              app.kubernetes.io/managed-by: ansible
+              miso.local/role: postgres-ro
+            annotations:
+              miso.local/desc: "CNPG Replica alias - postgres-ro.miso.local"
+              miso.local/target: "{{ cnpg_ro_fqdn }}"
+          spec:
+            type: ExternalName
+            externalName: {{ cnpg_ro_fqdn }}
+            ports:
+              - name: postgres
+                port: 5432
+                targetPort: 5432
+                protocol: TCP
+
+    - name: "2. ExternalName Service 적용"
+      ansible.builtin.command: kubectl apply -f /tmp/postgres-alias-svc.yaml
+      register: alias_apply
+      changed_when: >
+        'created' in alias_apply.stdout or
+        'configured' in alias_apply.stdout
+
+    - name: "2. 적용 결과"
+      ansible.builtin.debug:
+        msg: "{{ alias_apply.stdout_lines }}"
+
+    # -----------------------------------------------------------------
+    # STEP 3. DNS 해석 검증 (busybox 임시 Pod)
+    #   - postgres-rw/ro.miso.local → CNPG 서비스 CNAME 반환 확인
+    #   - s3.miso.local 도 함께 확인 (MinIO 공존 검증)
+    # -----------------------------------------------------------------
+    - name: "3. DNS 해석 검증 (busybox 임시 Pod)"
+      ansible.builtin.shell: |
+        kubectl run dns-test-pg \
+          --image=busybox:1.36 \
+          --restart=Never \
+          --rm \
+          --timeout=60s \
+          -- sh -c "
+            echo '--- postgres-rw.miso.local ---' &&
+            nslookup postgres-rw.miso.local &&
+            echo '--- postgres-ro.miso.local ---' &&
+            nslookup postgres-ro.miso.local &&
+            echo '--- s3.miso.local (MinIO 공존 확인) ---' &&
+            nslookup s3.miso.local || true
+          " 2>/dev/null || true
+      register: dns_verify
+      changed_when: false
+      failed_when: false
+
+    - name: "3. DNS 검증 결과"
+      ansible.builtin.debug:
+        msg: "{{ dns_verify.stdout_lines | default(['출력 없음 - 수동 확인 필요']) }}"
+
+    # -----------------------------------------------------------------
+    # STEP 4. 최종 상태 확인
+    # -----------------------------------------------------------------
+    - name: "4. 최종 상태 확인"
+      ansible.builtin.shell: |
+        echo "=== ExternalName Services ==="
+        kubectl get svc -n {{ cluster_namespace }} postgres-rw postgres-ro -o wide
+
+        echo ""
+        echo "=== CNPG 원본 서비스 ==="
+        kubectl get svc -n {{ cluster_namespace }} \
+          {{ cluster_name }}-rw \
+          {{ cluster_name }}-ro \
+          {{ cluster_name }}-r -o wide
+
+        echo ""
+        echo "=== CoreDNS miso.local 스탠자 ==="
+        kubectl get configmap coredns -n kube-system \
+          -o jsonpath='{.data.Corefile}' \
+          | grep -A 8 'miso\.local:53' || echo "(등록 없음)"
+      register: final_status
+      changed_when: false
+
+    - name: "4. 최종 상태 출력"
+      ansible.builtin.debug:
+        msg: "{{ final_status.stdout_lines }}"
+
+    - name: "임시 파일 정리"
+      ansible.builtin.file:
+        path: /tmp/postgres-alias-svc.yaml
+        state: absent
+
+    # -----------------------------------------------------------------
+    # 앱 연결 가이드
+    # -----------------------------------------------------------------
+    - name: "[ 앱 연결 문자열 가이드 ]"
+      ansible.builtin.debug:
+        msg:
+          - "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          - " PostgreSQL 도메인 접속 설정 완료"
+          - "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          - ""
+          - " [읽기/쓰기 - Primary]"
+          - "  Host : postgres-rw.miso.local"
+          - "  Port : 5432"
+          - "  DSN  : postgresql://miso_admin:<pw>@postgres-rw.miso.local:5432/miso"
+          - ""
+          - " [읽기 전용 - Replica]"
+          - "  Host : postgres-ro.miso.local"
+          - "  Port : 5432"
+          - "  DSN  : postgresql://miso_admin:<pw>@postgres-ro.miso.local:5432/miso"
+          - ""
+          - " ※ 클러스터 내부 Pod 에서만 유효합니다."
+          - " ※ CNPG Failover 시 연결 문자열 변경 없이 자동 반영됩니다."
+          - "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"

@@ -1,0 +1,25 @@
+---
+- name: Reboot All Nodes and Wait for Recovery
+  hosts: k8s:lb
+  become: yes
+  # 대상: k8s(masters+workers+db_nodes) + lb 만 재부팅
+  # bastion, harbor, monitoring 은 제외
+  gather_facts: no 
+
+  tasks:
+    - name: 1. Rebooting the machine
+      ansible.builtin.reboot:
+        msg: "Reboot initiated by Ansible after common setup"
+        connect_timeout: 5
+        reboot_timeout: 600 # 최대 10분까지 기다림
+        pre_reboot_delay: 0
+        post_reboot_delay: 30 # 부팅 후 서비스 안정화를 위해 30초 더 대기
+        test_command: whoami # 서버가 살아났는지 확인하기 위한 명령
+
+    - name: 2. Check System Uptime
+      shell: uptime
+      register: uptime_result
+
+    - name: 3. Print Uptime
+      debug:
+        msg: "서버가 정상적으로 재시작되었습니다: {{ uptime_result.stdout }}"

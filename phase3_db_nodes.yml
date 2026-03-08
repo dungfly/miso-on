@@ -1,0 +1,9 @@
+---
+# =================================================================
+# PHASE 3 - DB 노드 구성
+#
+# 실행: ansible-playbook -i hosts.ini phase3_db_nodes.yml
+# 소요: 약 15분
+# =================================================================
+- import_playbook: 10_db_node_join.yml
+- import_playbook: 11_db_node_tune.yml

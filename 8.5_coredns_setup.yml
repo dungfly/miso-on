@@ -1,0 +1,302 @@
+---
+# =================================================================
+# 08_5_coredns_setup.yml
+#
+# 목적:
+#   - CoreDNS에 miso.local "별도 존"을 만들지 않고
+#   - 기존 .:53 블록에 rewrite 규칙을 추가해
+#     *.miso.local -> *.default.svc.cluster.local 로 변환
+#
+# 왜 이렇게?
+#   - miso.local:53 { forward . kube-dnsIP } 는 CoreDNS 자기자신으로 forward라
+#     loop 플러그인에 걸려 CrashLoop 발생
+#   - rewrite 방식은 .:53 블록 내에서 처리하므로 루프 없음
+#
+# 등록 도메인:
+#   postgres-rw.miso.local → miso-db-rw.default.svc.cluster.local  (Primary)
+#   postgres-ro.miso.local → miso-db-ro.default.svc.cluster.local  (Replica)
+#   s3.miso.local          → minio-internal.default.svc.cluster.local (S3 API)
+#   s3console.miso.local   → minio.default.svc.cluster.local          (Console)
+#
+# 외부 접속 전용 (HAProxy → Monitor VM):
+#   monitor.miso.local      → 10.1.5.100 (Grafana)
+#   prometheus.miso.local   → 10.1.5.100 (Prometheus)
+#   alertmanager.miso.local → 10.1.5.100 (AlertManager)
+#
+# 멱등성: postgres-rw rewrite 라인 존재 여부로 판단 (rc 기반)
+# =================================================================
+
+- name: "CoreDNS에 miso.local rewrite 규칙 추가 (loop-free)"
+  hosts: bastion
+  become: no
+  environment:
+    KUBECONFIG: "{{ lookup('env', 'HOME') }}/.kube/config"
+  gather_facts: false
+
+  vars:
+    coredns_ns: kube-system
+    coredns_cm: coredns
+
+    # 도메인 추가/변경 시 여기만 수정
+    rewrite_rules: |
+      # ── miso.local 내부 도메인 (ansible 자동 추가) ─────────────
+      # *.miso.local → *.default.svc.cluster.local 로 rewrite
+      rewrite name exact postgres-rw.miso.local miso-db-rw.default.svc.cluster.local
+      rewrite name exact postgres-ro.miso.local miso-db-ro.default.svc.cluster.local
+      rewrite name exact s3.miso.local minio-internal.default.svc.cluster.local
+      rewrite name exact s3console.miso.local minio.default.svc.cluster.local
+      # ── 모니터링 (Monitor VM 직접 라우팅) ──────────────────────────
+      # HAProxy → 10.1.5.100 nginx → 각 서비스 (CoreDNS hosts 블록으로 처리)
+      # ─────────────────────────────────────────────────────────────
+
+    # Monitor VM 직접 IP 매핑 (K8s Ingress 미경유)
+    hosts_rules: |
+      # ── 모니터링 외부 접속 도메인 (ansible 자동 추가) ───────────
+      10.1.5.100 monitor.miso.local
+      10.1.5.100 prometheus.miso.local
+      10.1.5.100 alertmanager.miso.local
+      # ────────────────────────────────────────────────────────────
+
+  tasks:
+    # -----------------------------------------------------------------
+    # STEP 1. 사전 상태 확인
+    # -----------------------------------------------------------------
+    - name: "1. CoreDNS Pod 상태 확인"
+      ansible.builtin.command: >
+        kubectl get pods -n {{ coredns_ns }} -l k8s-app=kube-dns -o wide
+      register: coredns_pods
+      changed_when: false
+
+    - name: "1. CoreDNS Pod 상태 출력"
+      ansible.builtin.debug:
+        msg: "{{ coredns_pods.stdout_lines }}"
+
+    - name: "1. 현재 Corefile 확인"
+      ansible.builtin.shell: |
+        kubectl get configmap {{ coredns_cm }} -n {{ coredns_ns }} \
+          -o jsonpath='{.data.Corefile}'
+      register: current_corefile
+      changed_when: false
+
+    - name: "1. 현재 Corefile 출력"
+      ansible.builtin.debug:
+        msg: "{{ current_corefile.stdout_lines }}"
+
+    # -----------------------------------------------------------------
+    # STEP 2. CoreDNS ConfigMap 백업
+    # -----------------------------------------------------------------
+    - name: "2. CoreDNS ConfigMap 백업"
+      ansible.builtin.shell: |
+        set -e
+        BACKUP="/tmp/coredns-backup-$(date +%Y%m%d-%H%M%S).yaml"
+        kubectl get configmap {{ coredns_cm }} -n {{ coredns_ns }} -o yaml > "$BACKUP"
+        echo "BACKUP=$BACKUP"
+      register: backup_out
+      changed_when: false
+
+    - name: "2. 백업 결과 출력"
+      ansible.builtin.debug:
+        msg: "{{ backup_out.stdout_lines }}"
+
+    # -----------------------------------------------------------------
+    # STEP 3. 멱등성 체크 (rc 기반)
+    # -----------------------------------------------------------------
+    - name: "3. rewrite 규칙 기등록 여부 확인"
+      ansible.builtin.shell: |
+        kubectl get configmap {{ coredns_cm }} -n {{ coredns_ns }} \
+          -o jsonpath='{.data.Corefile}' \
+          | grep -q 'rewrite name exact postgres-rw\.miso\.local'
+      register: rewrite_exists
+      changed_when: false
+      failed_when: false
+
+    - name: "3. 멱등 상태 출력"
+      ansible.builtin.set_fact:
+        rewrite_already_applied: "{{ rewrite_exists.rc == 0 }}"
+
+    - name: "3. 적용 여부 출력"
+      ansible.builtin.debug:
+        msg: "rewrite_already_applied={{ rewrite_already_applied }} / {{ '이미 적용됨 → 스킵' if rewrite_already_applied else '미적용 → 패치 진행' }}"
+
+    # -----------------------------------------------------------------
+    # STEP 4. Corefile에 rewrite 규칙 삽입 (.:53 블록 내부)
+    #   - ready 라인 다음에 삽입 (없으면 kubernetes 라인 앞)
+    # -----------------------------------------------------------------
+    - name: "4. Corefile에 rewrite 규칙 삽입"
+      ansible.builtin.shell: |
+        set -e
+        python3 - <<'PY'
+        import subprocess, json, re, sys
+
+        ns      = "{{ coredns_ns }}"
+        cm_name = "{{ coredns_cm }}"
+        insert_text = """{{ rewrite_rules }}"""
+
+        raw = subprocess.check_output([
+            "kubectl","get","configmap",cm_name,"-n",ns,"-o","json"
+        ]).decode()
+        cm = json.loads(raw)
+        corefile = cm["data"]["Corefile"]
+
+        # 안전 체크 (이미 있으면 스킵)
+        if "rewrite name exact postgres-rw.miso.local" in corefile:
+            print("Already patched - skip")
+            sys.exit(0)
+
+        lines = corefile.splitlines(True)
+
+        # .:53 { 블록 시작 위치 찾기
+        start_idx = None
+        for i, l in enumerate(lines):
+            if re.match(r'^\s*\.:53\s*\{\s*$', l):
+                start_idx = i
+                break
+        if start_idx is None:
+            raise SystemExit("ERROR: Could not find '.:53 {' block")
+
+        # 삽입 위치 결정: ready 다음 > kubernetes 앞 > 블록 시작 직후
+        insert_at = None
+        for i in range(start_idx, len(lines)):
+            if re.match(r'^\s*ready\s*$', lines[i].rstrip()):
+                insert_at = i + 1
+                break
+        if insert_at is None:
+            for i in range(start_idx, len(lines)):
+                if re.match(r'^\s*kubernetes\s+', lines[i]):
+                    insert_at = i
+                    break
+        if insert_at is None:
+            insert_at = start_idx + 1
+
+        # 삽입 (들여쓰기 맞춤)
+        patch = insert_text.rstrip() + "\n"
+        lines.insert(insert_at, patch + "\n")
+
+        cm["data"]["Corefile"] = "".join(lines)
+
+        # hosts 블록 삽입 또는 기존 블록에 항목 추가
+        corefile_str = cm["data"]["Corefile"]
+        hosts_insert = """{{ hosts_rules }}"""
+        if "monitor.miso.local" not in corefile_str:
+            if re.search(r'hosts\s*\{', corefile_str):
+                # 기존 hosts 블록이 있으면 fallthrough 바로 앞에 항목 추가
+                new_entries = ""
+                for line in hosts_insert.strip().splitlines():
+                    new_entries += "\n" + line
+                corefile_str = re.sub(
+                    r'(hosts\s*\{[^}]*?)(\s+fallthrough)',
+                    lambda m: m.group(1) + new_entries + m.group(2),
+                    corefile_str, count=1, flags=re.DOTALL
+                )
+            else:
+                # hosts 블록이 없으면 새로 생성
+                hosts_block = "\n    hosts {\n" + hosts_insert.rstrip() + "\n      fallthrough\n    }\n"
+                corefile_str = re.sub(
+                    r'(\.:53\s*\{)',
+                    r'\1' + hosts_block,
+                    corefile_str
+                )
+            cm["data"]["Corefile"] = corefile_str
+
+        # apply 충돌 방지용 메타 제거
+        for field in ["resourceVersion","uid","creationTimestamp","generation","managedFields"]:
+            cm.get("metadata", {}).pop(field, None)
+
+        p = subprocess.run(
+            ["kubectl","apply","-f","-"],
+            input=json.dumps(cm).encode(),
+            capture_output=True
+        )
+        sys.stdout.write(p.stdout.decode())
+        if p.returncode != 0:
+            sys.stderr.write(p.stderr.decode())
+            sys.exit(p.returncode)
+        PY
+      when: not rewrite_already_applied
+      register: patch_out
+      changed_when: true
+
+    - name: "4. 패치 결과 출력"
+      ansible.builtin.debug:
+        msg: "{{ patch_out.stdout_lines | default(['스킵됨']) }}"
+
+    # -----------------------------------------------------------------
+    # STEP 5. CoreDNS 롤아웃 재시작
+    # -----------------------------------------------------------------
+    - name: "5. CoreDNS 롤아웃 재시작"
+      ansible.builtin.shell: |
+        set -e
+        kubectl rollout restart deployment/coredns -n {{ coredns_ns }}
+        kubectl rollout status deployment/coredns -n {{ coredns_ns }} --timeout=180s
+      when: not rewrite_already_applied
+      register: restart_out
+      changed_when: true
+
+    - name: "5. 재시작 결과 출력"
+      ansible.builtin.debug:
+        msg: "{{ restart_out.stdout_lines | default(['재시작 스킵 (이미 적용됨)']) }}"
+
+    # -----------------------------------------------------------------
+    # STEP 6. 적용 결과 검증
+    # -----------------------------------------------------------------
+    - name: "6. Corefile rewrite 규칙 확인"
+      ansible.builtin.shell: |
+        kubectl get configmap {{ coredns_cm }} -n {{ coredns_ns }} \
+          -o jsonpath='{.data.Corefile}' \
+          | grep -nA 8 'miso\.local' || echo "(miso.local 관련 라인 없음)"
+      register: verify_out
+      changed_when: false
+
+    - name: "6. 검증 출력"
+      ansible.builtin.debug:
+        msg: "{{ verify_out.stdout_lines }}"
+
+    # -----------------------------------------------------------------
+    # STEP 7. DNS 테스트 (busybox)
+    # -----------------------------------------------------------------
+    - name: "7. DNS 테스트 (busybox 임시 Pod)"
+      ansible.builtin.shell: |
+        kubectl run coredns-test \
+          --image=busybox:1.36 \
+          --restart=Never \
+          --rm \
+          --timeout=60s \
+          -- sh -c "
+            echo '--- kubernetes (기본 DNS 확인) ---' &&
+            nslookup kubernetes.default.svc.cluster.local &&
+            echo '--- postgres-rw.miso.local ---' &&
+            nslookup postgres-rw.miso.local || true &&
+            echo '--- s3.miso.local ---' &&
+            nslookup s3.miso.local || true
+          " 2>/dev/null || true
+      register: dns_test
+      changed_when: false
+      failed_when: false
+
+    - name: "7. DNS 테스트 출력"
+      ansible.builtin.debug:
+        msg: "{{ dns_test.stdout_lines | default(['출력 없음']) }}"
+
+    # -----------------------------------------------------------------
+    # 완료 안내
+    # -----------------------------------------------------------------
+    - name: "[ 완료 안내 ]"
+      ansible.builtin.debug:
+        msg:
+          - "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          - " CoreDNS miso.local rewrite 규칙 등록 완료"
+          - "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          - ""
+          - " 내부 Pod에서 사용 가능한 도메인:"
+          - "  postgres-rw.miso.local:5432  → CNPG Primary"
+          - "  postgres-ro.miso.local:5432  → CNPG Replica"
+          - "  s3.miso.local:9000           → MinIO S3 API"
+          - "  s3console.miso.local:9001    → MinIO Console"
+          - ""
+          - " 외부 접속 (Ingress, 변경 없음):"
+          - "  s3console.miso.local → HAProxy → Nginx Ingress"
+          - ""
+          - " 향후 추가 시 rewrite_rules 변수에 라인 추가:"
+          - "  rewrite name exact redis.miso.local redis.default.svc.cluster.local"
+          - "  rewrite name exact opensearch.miso.local opensearch-svc.default.svc.cluster.local"
+          - "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"

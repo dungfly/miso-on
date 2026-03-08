@@ -1,0 +1,662 @@
+---
+# =================================================================
+# 14_redis_setup.yml
+#
+# 목적: Redis Sentinel HA 클러스터 설치
+#
+# 구성:
+#   Master   x1  ┐
+#   Replica  x2  ┼ → db_nodes 각 1개씩 (podAntiAffinity Required)
+#   Sentinel x3  ┘ → worker_nodes 배치 (podAntiAffinity Preferred)
+#   Quorum: 2
+#
+# [배치 전략]
+#   db_nodes 3대: OpenSearch x3 + PostgreSQL x3 + Redis Data x3 (꽉 참)
+#   Sentinel은 경량 프로세스(데이터 없음) → worker 노드에 분산 배치
+#
+# 버전: redis:7.4.3-alpine (공식 이미지 - Docker Hub)
+# Persistence: RDB + AOF
+# 메모리: 4gb (POC) → 운영 시 -e redis_maxmemory=8gb
+#
+# 선행 조건:
+#   - 10_db_node_join.yml (db_nodes K8s 조인)
+#   - 11_db_node_tune.yml (db_nodes 튜닝)
+#
+# 실행:
+#   기본        : ansible-playbook -i hosts.ini 14_redis_setup.yml
+#   재설치      : ansible-playbook -i hosts.ini 14_redis_setup.yml -e force_reinstall=true
+#   메모리 변경 : ansible-playbook -i hosts.ini 14_redis_setup.yml -e redis_maxmemory=8gb -e redis_memory_request=8Gi -e redis_memory_limit=8Gi
+#   제거(PVC보존): ansible-playbook -i hosts.ini 14_redis_setup.yml -e redis_action=remove
+#   완전 삭제   : ansible-playbook -i hosts.ini 14_redis_setup.yml -e redis_action=purge
+# =================================================================
+
+- name: "Redis Sentinel HA 설치"
+  hosts: bastion
+  become: no
+  environment:
+    KUBECONFIG: "{{ lookup('env', 'HOME') }}/.kube/config"
+  gather_facts: false
+
+  vars:
+    redis_namespace: "default"
+    redis_name: "miso-redis"
+    redis_action: "install"       # install / remove (PVC 보존) / purge (완전 삭제)
+
+    # 이미지
+    redis_image: "harbor.miso.local/miso/redis:7.4.3-alpine"
+
+    # 메모리 설정 (POC: 4gb, 운영: 8gb)
+    redis_maxmemory: "4gb"
+    redis_memory_request: "4Gi"
+    redis_memory_limit: "4Gi"
+
+    # Sentinel 설정
+    sentinel_quorum: 2
+    sentinel_down_after: 5000
+    sentinel_failover_timeout: 60000
+    sentinel_master_name: "miso-redis-master"
+
+    # Persistence
+    redis_storage_size: "20Gi"
+    redis_storageclass: "local-path"
+
+    # 자격증명
+    redis_password: "misoredis"
+
+    # db_nodes 배치 (Redis Data 전용)
+    db_node_label_key: "node-role.kubernetes.io/db"
+    db_node_label_value: "true"
+    db_node_taint_key: "dedicated"
+    db_node_taint_value: "db"
+
+  tasks:
+    # -----------------------------------------------------------------
+    # STEP 0. 제거 모드
+    # -----------------------------------------------------------------
+    - name: "0. [remove] Redis 리소스 제거 (PVC 보존)"
+      ansible.builtin.shell: |
+        kubectl delete statefulset {{ redis_name }} -n {{ redis_namespace }} --ignore-not-found=true
+        kubectl delete statefulset {{ redis_name }}-sentinel -n {{ redis_namespace }} --ignore-not-found=true
+        kubectl delete service {{ redis_name }} {{ redis_name }}-headless {{ redis_name }}-sentinel -n {{ redis_namespace }} --ignore-not-found=true
+        kubectl delete configmap {{ redis_name }}-config {{ redis_name }}-sentinel-config -n {{ redis_namespace }} --ignore-not-found=true
+        kubectl delete secret {{ redis_name }}-auth -n {{ redis_namespace }} --ignore-not-found=true
+        echo "제거 완료 (PVC 보존)"
+        kubectl get pvc -n {{ redis_namespace }} | grep {{ redis_name }} || echo "  PVC 없음"
+      when: redis_action == 'remove'
+      register: remove_out
+      changed_when: true
+
+    - name: "0. [remove] 제거 결과"
+      ansible.builtin.debug:
+        msg: "{{ remove_out.stdout_lines | default([]) }}"
+      when: redis_action == 'remove'
+
+    - name: "0. [purge] Redis 리소스 + PVC 완전 삭제"
+      ansible.builtin.shell: |
+        kubectl delete statefulset {{ redis_name }} -n {{ redis_namespace }} --ignore-not-found=true
+        kubectl delete statefulset {{ redis_name }}-sentinel -n {{ redis_namespace }} --ignore-not-found=true
+        kubectl delete service {{ redis_name }} {{ redis_name }}-headless {{ redis_name }}-sentinel -n {{ redis_namespace }} --ignore-not-found=true
+        kubectl delete configmap {{ redis_name }}-config {{ redis_name }}-sentinel-config -n {{ redis_namespace }} --ignore-not-found=true
+        kubectl delete secret {{ redis_name }}-auth -n {{ redis_namespace }} --ignore-not-found=true
+        sleep 3
+        kubectl delete pvc -n {{ redis_namespace }} -l app={{ redis_name }} --ignore-not-found=true
+        echo "완전 삭제 완료"
+      when: redis_action == 'purge'
+      register: purge_out
+      changed_when: true
+
+    - name: "0. [purge] 완전 삭제 결과"
+      ansible.builtin.debug:
+        msg: "{{ purge_out.stdout_lines | default([]) }}"
+      when: redis_action == 'purge'
+
+    - name: "0. 제거/삭제 완료 후 종료"
+      ansible.builtin.meta: end_play
+      when: redis_action in ['remove', 'purge']
+
+    # -----------------------------------------------------------------
+    # STEP 1. 기존 리소스 확인
+    # -----------------------------------------------------------------
+    - name: "1. 기존 Redis StatefulSet 존재 여부 확인"
+      ansible.builtin.shell: |
+        kubectl get statefulset {{ redis_name }} -n {{ redis_namespace }} \
+          --no-headers 2>/dev/null | wc -l
+      register: redis_exists
+      changed_when: false
+
+    - name: "1. [force_reinstall] 기존 리소스 제거 (PVC 보존)"
+      ansible.builtin.shell: |
+        kubectl delete statefulset {{ redis_name }} -n {{ redis_namespace }} --ignore-not-found=true
+        kubectl delete statefulset {{ redis_name }}-sentinel -n {{ redis_namespace }} --ignore-not-found=true
+        kubectl delete service {{ redis_name }} {{ redis_name }}-headless {{ redis_name }}-sentinel -n {{ redis_namespace }} --ignore-not-found=true
+        kubectl delete configmap {{ redis_name }}-config {{ redis_name }}-sentinel-config -n {{ redis_namespace }} --ignore-not-found=true
+        for i in $(seq 1 30); do
+          COUNT=$(kubectl get pods -n {{ redis_namespace }} -l app={{ redis_name }} --no-headers 2>/dev/null | wc -l)
+          [ "$COUNT" -eq 0 ] && echo "Pod 종료 완료" && break
+          echo "대기 중... (${COUNT}개)"
+          sleep 5
+        done
+      when:
+        - force_reinstall | default(false) | bool
+        - redis_exists.stdout | trim | int > 0
+      register: force_remove
+      changed_when: true
+
+    # -----------------------------------------------------------------
+    # STEP 2. Secret 생성
+    # -----------------------------------------------------------------
+    - name: "2. Redis 자격증명 Secret 생성"
+      ansible.builtin.shell: |
+        kubectl create secret generic {{ redis_name }}-auth \
+          -n {{ redis_namespace }} \
+          --from-literal=redis-password={{ redis_password }} \
+          --dry-run=client -o yaml | kubectl apply -f -
+      register: secret_out
+      changed_when: "'created' in secret_out.stdout or 'configured' in secret_out.stdout"
+
+    # -----------------------------------------------------------------
+    # STEP 3. ConfigMap 생성
+    # -----------------------------------------------------------------
+    - name: "3-a. Redis ConfigMap 파일 생성"
+      ansible.builtin.copy:
+        dest: /tmp/redis-configmap.yaml
+        mode: "0644"
+        content: |
+          apiVersion: v1
+          kind: ConfigMap
+          metadata:
+            name: {{ redis_name }}-config
+            namespace: {{ redis_namespace }}
+          data:
+            redis.conf: |
+              requirepass {{ redis_password }}
+              masterauth {{ redis_password }}
+              maxmemory {{ redis_maxmemory }}
+              maxmemory-policy allkeys-lru
+              save 900 1
+              save 300 10
+              save 60 10000
+              appendonly yes
+              appendfsync everysec
+              auto-aof-rewrite-percentage 100
+              auto-aof-rewrite-min-size 64mb
+          ---
+          apiVersion: v1
+          kind: ConfigMap
+          metadata:
+            name: {{ redis_name }}-sentinel-config
+            namespace: {{ redis_namespace }}
+          data:
+            sentinel.conf: |
+              sentinel resolve-hostnames yes
+              sentinel announce-hostnames yes
+              sentinel monitor {{ sentinel_master_name }} {{ redis_name }}-0.{{ redis_name }}-headless.{{ redis_namespace }}.svc.cluster.local 6379 {{ sentinel_quorum }}
+              sentinel auth-pass {{ sentinel_master_name }} {{ redis_password }}
+              sentinel down-after-milliseconds {{ sentinel_master_name }} {{ sentinel_down_after }}
+              sentinel failover-timeout {{ sentinel_master_name }} {{ sentinel_failover_timeout }}
+              sentinel parallel-syncs {{ sentinel_master_name }} 1
+
+    - name: "3-b. Redis ConfigMap 적용"
+      ansible.builtin.command: kubectl apply -f /tmp/redis-configmap.yaml
+      register: configmap_out
+      changed_when: "'created' in configmap_out.stdout or 'configured' in configmap_out.stdout"
+
+    - name: "3-c. ConfigMap 생성 결과"
+      ansible.builtin.debug:
+        msg: "{{ configmap_out.stdout_lines }}"
+
+    - name: "3-d. 임시 ConfigMap 파일 정리"
+      ansible.builtin.file:
+        path: /tmp/redis-configmap.yaml
+        state: absent
+
+    # -----------------------------------------------------------------
+    # STEP 4. 매니페스트 생성 및 적용
+    # -----------------------------------------------------------------
+    - name: "4. Redis 매니페스트 생성"
+      ansible.builtin.copy:
+        dest: /tmp/redis-manifest.yaml
+        mode: "0644"
+        content: |
+          # ============================================================
+          # 1. Headless Service
+          # ============================================================
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: {{ redis_name }}-headless
+            namespace: {{ redis_namespace }}
+            labels:
+              app: {{ redis_name }}
+          spec:
+            clusterIP: None
+            ports:
+              - name: redis
+                port: 6379
+            selector:
+              app: {{ redis_name }}
+              role: redis
+          ---
+          # ============================================================
+          # 2. Redis ClusterIP Service
+          # ============================================================
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: {{ redis_name }}
+            namespace: {{ redis_namespace }}
+            labels:
+              app: {{ redis_name }}
+          spec:
+            type: ClusterIP
+            ports:
+              - name: redis
+                port: 6379
+                targetPort: 6379
+            selector:
+              app: {{ redis_name }}
+              role: redis
+          ---
+          # ============================================================
+          # 3. Sentinel Service
+          # ============================================================
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: {{ redis_name }}-sentinel
+            namespace: {{ redis_namespace }}
+            labels:
+              app: {{ redis_name }}
+          spec:
+            type: ClusterIP
+            ports:
+              - name: sentinel
+                port: 26379
+                targetPort: 26379
+            selector:
+              app: {{ redis_name }}
+              role: sentinel
+          ---
+          # ============================================================
+          # 4. Redis StatefulSet (db_nodes - Master 1 + Replica 2)
+          # ============================================================
+          apiVersion: apps/v1
+          kind: StatefulSet
+          metadata:
+            name: {{ redis_name }}
+            namespace: {{ redis_namespace }}
+          spec:
+            serviceName: {{ redis_name }}-headless
+            replicas: 3
+            selector:
+              matchLabels:
+                app: {{ redis_name }}
+                role: redis
+            template:
+              metadata:
+                labels:
+                  app: {{ redis_name }}
+                  role: redis
+              spec:
+                nodeSelector:
+                  {{ db_node_label_key }}: "{{ db_node_label_value }}"
+                tolerations:
+                  - key: "{{ db_node_taint_key }}"
+                    operator: "Equal"
+                    value: "{{ db_node_taint_value }}"
+                    effect: "NoSchedule"
+                affinity:
+                  podAntiAffinity:
+                    requiredDuringSchedulingIgnoredDuringExecution:
+                      - labelSelector:
+                          matchExpressions:
+                            - key: app
+                              operator: In
+                              values: ["{{ redis_name }}"]
+                            - key: role
+                              operator: In
+                              values: ["redis"]
+                        topologyKey: "kubernetes.io/hostname"
+                initContainers:
+                  - name: init-redis
+                    image: {{ redis_image }}
+                    command:
+                      - sh
+                      - -c
+                      - |
+                        INDEX=${HOSTNAME##*-}
+                        cp /config/redis.conf /data/redis.conf
+                        if [ "$INDEX" != "0" ]; then
+                          echo "replicaof {{ redis_name }}-0.{{ redis_name }}-headless.{{ redis_namespace }}.svc.cluster.local 6379" >> /data/redis.conf
+                        fi
+                    volumeMounts:
+                      - name: config
+                        mountPath: /config
+                      - name: data
+                        mountPath: /data
+                containers:
+                  - name: redis
+                    image: {{ redis_image }}
+                    command: ["redis-server", "/data/redis.conf"]
+                    ports:
+                      - containerPort: 6379
+                        name: redis
+                    resources:
+                      requests:
+                        memory: {{ redis_memory_request }}
+                        cpu: "500m"
+                      limits:
+                        memory: {{ redis_memory_limit }}
+                        cpu: "1000m"
+                    volumeMounts:
+                      - name: data
+                        mountPath: /data
+                      - name: config
+                        mountPath: /config
+                    readinessProbe:
+                      exec:
+                        command:
+                          - sh
+                          - -c
+                          - redis-cli -a {{ redis_password }} ping | grep -q PONG
+                      initialDelaySeconds: 10
+                      periodSeconds: 5
+                    livenessProbe:
+                      exec:
+                        command:
+                          - sh
+                          - -c
+                          - redis-cli -a {{ redis_password }} ping | grep -q PONG
+                      initialDelaySeconds: 30
+                      periodSeconds: 10
+                volumes:
+                  - name: config
+                    configMap:
+                      name: {{ redis_name }}-config
+            volumeClaimTemplates:
+              - metadata:
+                  name: data
+                  labels:
+                    app: {{ redis_name }}
+                spec:
+                  accessModes: ["ReadWriteOnce"]
+                  storageClassName: {{ redis_storageclass }}
+                  resources:
+                    requests:
+                      storage: {{ redis_storage_size }}
+          ---
+          # ============================================================
+          # 5. Sentinel StatefulSet (worker_nodes - 경량 프로세스)
+          #    db_nodes 3대: OpenSearch x3 + PostgreSQL x3 + Redis x3 꽉 참
+          #    Sentinel은 데이터 없음 → worker 노드에 분산 배치
+          # ============================================================
+          apiVersion: apps/v1
+          kind: StatefulSet
+          metadata:
+            name: {{ redis_name }}-sentinel
+            namespace: {{ redis_namespace }}
+          spec:
+            serviceName: {{ redis_name }}-sentinel
+            replicas: 3
+            selector:
+              matchLabels:
+                app: {{ redis_name }}
+                role: sentinel
+            template:
+              metadata:
+                labels:
+                  app: {{ redis_name }}
+                  role: sentinel
+              spec:
+                affinity:
+                  podAntiAffinity:
+                    preferredDuringSchedulingIgnoredDuringExecution:
+                      - weight: 100
+                        podAffinityTerm:
+                          labelSelector:
+                            matchExpressions:
+                              - key: app
+                                operator: In
+                                values: ["{{ redis_name }}"]
+                              - key: role
+                                operator: In
+                                values: ["sentinel"]
+                          topologyKey: "kubernetes.io/hostname"
+                initContainers:
+                  - name: init-sentinel
+                    image: {{ redis_image }}
+                    command:
+                      - sh
+                      - -c
+                      - cp /config/sentinel.conf /data/sentinel.conf && chmod 777 /data/sentinel.conf
+                    volumeMounts:
+                      - name: config
+                        mountPath: /config
+                      - name: data
+                        mountPath: /data
+                containers:
+                  - name: sentinel
+                    image: {{ redis_image }}
+                    command: ["redis-sentinel", "/data/sentinel.conf"]
+                    ports:
+                      - containerPort: 26379
+                        name: sentinel
+                    resources:
+                      requests:
+                        memory: "256Mi"
+                        cpu: "100m"
+                      limits:
+                        memory: "512Mi"
+                        cpu: "200m"
+                    volumeMounts:
+                      - name: data
+                        mountPath: /data
+                      - name: config
+                        mountPath: /config
+                    readinessProbe:
+                      exec:
+                        command:
+                          - sh
+                          - -c
+                          - redis-cli -p 26379 ping | grep -q PONG
+                      initialDelaySeconds: 15
+                      periodSeconds: 5
+                volumes:
+                  - name: config
+                    configMap:
+                      name: {{ redis_name }}-sentinel-config
+                  - name: data
+                    emptyDir: {}
+
+    - name: "4. Redis 매니페스트 적용"
+      ansible.builtin.command: kubectl apply -f /tmp/redis-manifest.yaml
+      register: apply_out
+      changed_when: "'created' in apply_out.stdout or 'configured' in apply_out.stdout"
+
+    - name: "4. 적용 결과"
+      ansible.builtin.debug:
+        msg: "{{ apply_out.stdout_lines }}"
+
+    # -----------------------------------------------------------------
+    # STEP 5. 설정 변경 감지 + Rolling Restart
+    # -----------------------------------------------------------------
+    - name: "5. ConfigMap 변경 시 Rolling Restart"
+      ansible.builtin.shell: |
+        if echo "{{ apply_out.stdout }}" | grep -q "configured"; then
+          echo "변경 감지 → Rolling Restart"
+          kubectl rollout restart statefulset/{{ redis_name }} -n {{ redis_namespace }}
+          kubectl rollout restart statefulset/{{ redis_name }}-sentinel -n {{ redis_namespace }}
+        else
+          echo "변경 없음 - Rolling Restart 스킵"
+        fi
+      register: restart_out
+      changed_when: "'Rolling Restart' in restart_out.stdout"
+
+    - name: "5. Rolling Restart 결과"
+      ansible.builtin.debug:
+        msg: "{{ restart_out.stdout_lines }}"
+
+    # -----------------------------------------------------------------
+    # STEP 6. Pod Ready 대기
+    # -----------------------------------------------------------------
+    - name: "6. Redis Pod Ready 대기"
+      ansible.builtin.shell: |
+        kubectl wait pod \
+          -l "app={{ redis_name }},role=redis" \
+          -n {{ redis_namespace }} \
+          --for=condition=Ready \
+          --timeout=300s
+      register: redis_wait
+      changed_when: false
+
+    - name: "6. Sentinel Pod Ready 대기"
+      ansible.builtin.shell: |
+        kubectl wait pod \
+          -l "app={{ redis_name }},role=sentinel" \
+          -n {{ redis_namespace }} \
+          --for=condition=Ready \
+          --timeout=300s
+      register: sentinel_wait
+      changed_when: false
+
+    # -----------------------------------------------------------------
+    # STEP 7. CoreDNS rewrite 추가
+    # -----------------------------------------------------------------
+    - name: "7. CoreDNS redis.miso.local 등록 여부 확인"
+      ansible.builtin.shell: |
+        kubectl get configmap coredns -n kube-system \
+          -o jsonpath='{.data.Corefile}' | grep -q 'redis\.miso\.local'
+      register: redis_dns_exists
+      changed_when: false
+      failed_when: false
+
+    - name: "7. CoreDNS redis.miso.local rewrite 추가"
+      ansible.builtin.shell: |
+        python3 - <<'PY'
+        import subprocess, json, sys
+
+        raw = subprocess.check_output([
+            "kubectl","get","configmap","coredns","-n","kube-system","-o","json"
+        ]).decode()
+        cm = json.loads(raw)
+        corefile = cm["data"]["Corefile"]
+
+        new_rules = (
+            "      rewrite name exact redis.miso.local "
+            "miso-redis-sentinel.default.svc.cluster.local\n"
+        )
+
+        lines = corefile.splitlines(True)
+        insert_at = None
+        for i, l in enumerate(lines):
+            if "rewrite name exact" in l and "miso.local" in l:
+                insert_at = i + 1
+
+        if insert_at is None:
+            print("ERROR: rewrite 블록을 찾을 수 없음")
+            sys.exit(1)
+
+        lines.insert(insert_at, new_rules)
+        cm["data"]["Corefile"] = "".join(lines)
+
+        for field in ["resourceVersion","uid","creationTimestamp","generation","managedFields"]:
+            cm.get("metadata", {}).pop(field, None)
+
+        p = subprocess.run(
+            ["kubectl","apply","-f","-"],
+            input=json.dumps(cm).encode(),
+            capture_output=True
+        )
+        sys.stdout.write(p.stdout.decode())
+        if p.returncode != 0:
+            sys.stderr.write(p.stderr.decode())
+            sys.exit(p.returncode)
+        PY
+      when: redis_dns_exists.rc != 0
+      register: dns_patch
+      changed_when: true
+
+    - name: "7. CoreDNS 재시작"
+      ansible.builtin.shell: |
+        kubectl rollout restart deployment/coredns -n kube-system
+        kubectl rollout status deployment/coredns -n kube-system --timeout=60s
+      when: redis_dns_exists.rc != 0
+      changed_when: true
+
+    - name: "7. DNS 결과"
+      ansible.builtin.debug:
+        msg: "{{ 'redis.miso.local 이미 등록됨 - 스킵' if redis_dns_exists.rc == 0 else 'redis.miso.local 등록 완료' }}"
+
+    # -----------------------------------------------------------------
+    # STEP 8. 접속 검증
+    # -----------------------------------------------------------------
+    - name: "8. Redis Master 확인 (Sentinel 통해)"
+      ansible.builtin.shell: |
+        kubectl exec -n {{ redis_namespace }} {{ redis_name }}-sentinel-0 -- \
+          redis-cli -p 26379 sentinel master {{ sentinel_master_name }} 2>/dev/null || echo "검증 실패"
+      register: redis_verify
+      changed_when: false
+      failed_when: false
+
+    - name: "8. 접속 검증 결과"
+      ansible.builtin.debug:
+        msg: "{{ redis_verify.stdout_lines | default(['출력 없음']) }}"
+
+    # -----------------------------------------------------------------
+    # STEP 9. 최종 상태 확인
+    # -----------------------------------------------------------------
+    - name: "9. 최종 상태 확인"
+      ansible.builtin.shell: |
+        echo "=== Pods ==="
+        kubectl get pods -n {{ redis_namespace }} -l app={{ redis_name }} -o wide
+        echo
+        echo "=== Services ==="
+        kubectl get svc -n {{ redis_namespace }} -l app={{ redis_name }}
+        echo
+        echo "=== PVC ==="
+        kubectl get pvc -n {{ redis_namespace }} -l app={{ redis_name }}
+        echo
+        echo "=== CoreDNS rewrite ==="
+        kubectl get configmap coredns -n kube-system \
+          -o jsonpath='{.data.Corefile}' | grep "miso.local"
+      register: final_status
+      changed_when: false
+
+    - name: "9. 최종 상태 출력"
+      ansible.builtin.debug:
+        msg: "{{ final_status.stdout_lines }}"
+
+    - name: "10. 임시 파일 정리"
+      ansible.builtin.file:
+        path: /tmp/redis-manifest.yaml
+        state: absent
+
+    # -----------------------------------------------------------------
+    # 완료 안내
+    # -----------------------------------------------------------------
+    - name: "[ 완료 안내 ]"
+      ansible.builtin.debug:
+        msg:
+          - "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          - " Redis Sentinel HA 설치 완료"
+          - "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          - ""
+          - " [구성]"
+          - "  Redis   : Master x1 + Replica x2 → db_nodes (Required AntiAffinity)"
+          - "  Sentinel: x3                      → worker_nodes (Preferred AntiAffinity)"
+          - "  Quorum  : {{ sentinel_quorum }}"
+          - "  메모리  : {{ redis_maxmemory }} / Persistence: RDB + AOF"
+          - ""
+          - " [내부 접속 (앱에서)]"
+          - "  Sentinel: redis.miso.local:26379  (CoreDNS rewrite)"
+          - "  또는    : {{ redis_name }}-sentinel:26379"
+          - "  Master  : {{ redis_name }}-0.{{ redis_name }}-headless:6379"
+          - ""
+          - " [자격증명 확인]"
+          - "  kubectl get secret {{ redis_name }}-auth"
+          - "    -o jsonpath='{.data.redis-password}' | base64 -d"
+          - ""
+          - " [운영 전환 메모리 변경]"
+          - "  ansible-playbook -i hosts.ini 14_redis_setup.yml"
+          - "    -e redis_maxmemory=8gb -e redis_memory_request=8Gi -e redis_memory_limit=8Gi"
+          - "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"

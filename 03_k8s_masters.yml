@@ -1,0 +1,268 @@
+---
+- name: Setup Kubernetes High Availability Masters
+  hosts: masters
+  become: yes
+  vars:
+    k8s_version: "1.30"
+    pod_cidr: "10.244.0.0/16"
+    api_endpoint: "10.1.1.10" # HAProxy IP (6443 포트 중계용)
+
+  tasks:
+    # ---------------------------------------------------------------
+    # STEP 1. 커널 및 네트워크 사전 준비
+    # ---------------------------------------------------------------
+    - name: 1. 커널 모듈 로드 (overlay, br_netfilter)
+      ansible.builtin.command: modprobe {{ item }}
+      loop:
+        - overlay
+        - br_netfilter
+
+    - name: 2. 커널 모듈 부팅 시 자동 로드 설정
+      copy:
+        dest: /etc/modules-load.d/k8s.conf
+        content: |
+          overlay
+          br_netfilter
+
+    - name: 3. sysctl 네트워크 설정 (Persistence 포함)
+      ansible.builtin.command: sysctl -w {{ item.name }}={{ item.value }}
+      loop:
+        - { name: 'net.bridge.bridge-nf-call-iptables',  value: '1' }
+        - { name: 'net.bridge.bridge-nf-call-ip6tables', value: '1' }
+        - { name: 'net.ipv4.ip_forward',                 value: '1' }
+
+    # ---------------------------------------------------------------
+    # STEP 2. Containerd 설치 및 설정
+    # ---------------------------------------------------------------
+    - name: 4. Containerd 설치
+      apt:
+        name: containerd
+        state: present
+        update_cache: yes
+
+    - name: 5. Containerd 기본 설정 생성
+      shell: |
+        mkdir -p /etc/containerd
+        containerd config default > /etc/containerd/config.toml
+      args:
+        creates: /etc/containerd/config.toml
+
+    - name: 6. Containerd SystemdCgroup 활성화
+      replace:
+        path: /etc/containerd/config.toml
+        regexp: 'SystemdCgroup = false'
+        replace: 'SystemdCgroup = true'
+
+    - name: 7. Containerd 즉시 재시작 및 활성화
+      # 핸들러(handler)로 처리하면 플레이 끝에 실행되어
+      # kubeadm init 전에 설정이 반영되지 않으므로 여기서 즉시 재시작합니다.
+      ansible.builtin.systemd:
+        name: containerd
+        state: restarted
+        enabled: yes
+        daemon_reload: yes
+
+    - name: 8. Containerd 소켓 준비 대기
+      wait_for:
+        path: /run/containerd/containerd.sock
+        state: present
+        timeout: 30
+
+    # ---------------------------------------------------------------
+    # STEP 3. Kubernetes 패키지 설치
+    # ---------------------------------------------------------------
+    - name: 9. /etc/apt/keyrings 디렉토리 생성
+      file:
+        path: /etc/apt/keyrings
+        state: directory
+        mode: '0755'
+
+    - name: 10. K8s 저장소 GPG 키 등록
+      shell: |
+        curl -fsSL https://pkgs.k8s.io/core:/stable:/v{{ k8s_version }}/deb/Release.key \
+          | gpg --dearmor --yes -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+      args:
+        creates: /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+
+    - name: 11. K8s apt 저장소 등록
+      copy:
+        dest: /etc/apt/sources.list.d/kubernetes.list
+        content: |
+          deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v{{ k8s_version }}/deb/ /
+
+    - name: 12. kubelet / kubeadm / kubectl 설치
+      apt:
+        name:
+          - kubelet
+          - kubeadm
+          - kubectl
+        state: present
+        update_cache: yes
+
+    - name: 13. kubelet / kubeadm / kubectl 버전 고정 (apt-mark hold)
+      dpkg_selections:
+        name: "{{ item }}"
+        selection: hold
+      loop:
+        - kubelet
+        - kubeadm
+        - kubectl
+
+    - name: 14. kubelet 활성화 (시작은 kubeadm init 후 자동)
+      ansible.builtin.systemd:
+        name: kubelet
+        enabled: yes
+        daemon_reload: yes
+
+    # ---------------------------------------------------------------
+    # STEP 4. 클러스터 초기화 (master1)
+    # ---------------------------------------------------------------
+    - name: 15. kubeadm init (master1 Only)
+      command: >
+        kubeadm init
+        --pod-network-cidr={{ pod_cidr }}
+        --control-plane-endpoint="{{ api_endpoint }}:6443"
+        --upload-certs
+      when: inventory_hostname == 'master1'
+      args:
+        creates: /etc/kubernetes/admin.conf
+
+    - name: 16. 로컬 API 서버 포트 기동 대기 (master1 Only)
+      wait_for:
+        host: 127.0.0.1
+        port: 6443
+        delay: 10
+        timeout: 180
+      when: inventory_hostname == 'master1'
+
+    - name: 17. API 서버 /healthz 정상 응답 대기 (master1 Only)
+      uri:
+        url: https://127.0.0.1:6443/healthz
+        validate_certs: no
+        status_code: 200
+      register: healthz_result
+      until: healthz_result.status == 200
+      retries: 30
+      delay: 10
+      when: inventory_hostname == 'master1'
+
+    # ---------------------------------------------------------------
+    # STEP 4-b. bastion(Ansible 실행 호스트)에서 kubectl용 kubeconfig 준비
+    # - master1의 admin.conf를 bastion으로 가져오고, server를 HAProxy(api_endpoint)로 고정
+    # ---------------------------------------------------------------
+    - name: 17-b. master1 admin.conf를 bastion으로 fetch (master1 Only)
+      fetch:
+        src: /etc/kubernetes/admin.conf
+        dest: /tmp/kubeconfig-admin.conf
+        flat: yes
+      when: inventory_hostname == 'master1'
+
+    - name: 17-c. bastion kubeconfig의 server를 HAProxy로 고정 (run_once)
+      delegate_to: localhost
+      run_once: true
+      become: false
+      shell: |
+        set -e
+        test -f /tmp/kubeconfig-admin.conf
+        sed -i 's|server: https://.*:6443|server: https://{{ api_endpoint }}:6443|g' /tmp/kubeconfig-admin.conf
+
+    - name: 17-d. bastion에서 kubectl client 확인 (run_once)
+      delegate_to: localhost
+      run_once: true
+      become: false
+      command: kubectl version --client=true
+
+    - name: 17-e. bastion kubeconfig로 cluster-info 확인 (run_once)
+      delegate_to: localhost
+      run_once: true
+      become: false
+      environment:
+        KUBECONFIG: /tmp/kubeconfig-admin.conf
+      command: kubectl cluster-info
+
+
+    # ---------------------------------------------------------------
+    # STEP 5. 조인 정보 추출 (master1) - hostvars 방식으로 공유
+    # ---------------------------------------------------------------
+    - name: 18-a. 로컬 직접 통신용 kubeconfig 생성 (master1 Only)
+      shell: |
+        cp /etc/kubernetes/admin.conf /tmp/admin-local.conf
+        sed -i 's|server: https://{{ api_endpoint }}:6443|server: https://{{ ansible_default_ipv4.address }}:6443|g' \
+          /tmp/admin-local.conf
+      when: inventory_hostname == 'master1'
+
+    - name: 18-b. 조인 커맨드 추출 (master1 Only)
+      shell: |
+        kubeadm token create --print-join-command \
+          --kubeconfig /tmp/admin-local.conf
+      register: join_cmd
+      when: inventory_hostname == 'master1'
+
+    - name: 18-c. 인증서 키 추출 (master1 Only)
+      shell: |
+        kubeadm init phase upload-certs --upload-certs \
+          --kubeconfig /tmp/admin-local.conf | tail -n 1
+      register: cert_key
+      when: inventory_hostname == 'master1'
+
+    - name: 18-d. 임시 kubeconfig 삭제 (master1 Only)
+      file:
+        path: /tmp/admin-local.conf
+        state: absent
+      when: inventory_hostname == 'master1'
+
+    # ---------------------------------------------------------------
+    # STEP 6. master2, 3 조인
+    # hostvars['master1']로 직접 참조 → delegate_facts 불필요
+    # ---------------------------------------------------------------
+    - name: 20. 마스터 조인 (master2, 3)
+      command: >
+        {{ hostvars['master1']['join_cmd']['stdout'] }}
+        --control-plane
+        --certificate-key {{ hostvars['master1']['cert_key']['stdout'] }}
+      when: inventory_hostname in ['master2', 'master3']
+      args:
+        creates: /etc/kubernetes/admin.conf
+    # ---------------------------------------------------------------
+    # STEP 7. CNI 설치 (bastion에서 실행)
+    # - kubectl은 bastion(Ansible 실행 호스트)에서 수행
+    # - API 접속은 HAProxy(api_endpoint)로 고정된 kubeconfig 사용
+    # ---------------------------------------------------------------
+    - name: 21. Calico tigera-operator 설치 (bastion run_once)
+      delegate_to: localhost
+      run_once: true
+      become: false
+      environment:
+        KUBECONFIG: /tmp/kubeconfig-admin.conf
+      shell: |
+        kubectl apply --server-side --force-conflicts           -f https://raw.githubusercontent.com/projectcalico/calico/v3.27.0/manifests/tigera-operator.yaml           --validate=false
+
+    - name: 22. Calico custom-resources 다운로드 및 CIDR 적용 (bastion run_once)
+      delegate_to: localhost
+      run_once: true
+      become: false
+      environment:
+        KUBECONFIG: /tmp/kubeconfig-admin.conf
+      shell: |
+        curl -L -o /tmp/custom-resources.yaml           https://raw.githubusercontent.com/projectcalico/calico/v3.27.0/manifests/custom-resources.yaml
+        sed -i "s|cidr: 192.168.0.0/16|cidr: {{ pod_cidr }}|g" /tmp/custom-resources.yaml
+        sed -i "s|encapsulation: VXLANCrossSubnet|encapsulation: VXLAN|g" /tmp/custom-resources.yaml
+        kubectl apply -f /tmp/custom-resources.yaml --validate=false
+
+    - name: 23. 노드/파드 상태 확인 (bastion run_once)
+      delegate_to: localhost
+      run_once: true
+      become: false
+      environment:
+        KUBECONFIG: /tmp/kubeconfig-admin.conf
+      shell: |
+        kubectl get nodes -o wide
+        kubectl get pods -A
+      register: verify_out
+      changed_when: false
+
+    - debug:
+        var: verify_out.stdout_lines
+      delegate_to: localhost
+      run_once: true
+      when: verify_out is defined

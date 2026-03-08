@@ -1,0 +1,62 @@
+---
+- name: Bastion Post-Setup (Audit & Security)
+  hosts: localhost
+  connection: local
+  become: yes
+
+  tasks:
+    - name: 0. needrestart 자동 재시작 + 커널 힌트 팝업 억제
+      ansible.builtin.lineinfile:
+        path: /etc/needrestart/needrestart.conf
+        regexp: "{{ item.regexp }}"
+        line: "{{ item.line }}"
+        create: yes
+      loop:
+        - { regexp: '^#?\$nrconf\{restart\}',    line: "$nrconf{restart} = 'a';" }
+        - { regexp: '^#?\$nrconf\{kernelhints\}', line: "$nrconf{kernelhints} = -1;" }
+      ignore_errors: yes
+
+    - name: 1. ansible.cfg 생성 (log_path, host_key_checking)
+      ansible.builtin.copy:
+        dest: /etc/ansible/ansible.cfg
+        mode: '0644'
+        content: |
+          [defaults]
+          log_path = /var/log/ansible.log
+          host_key_checking = False
+
+    - name: 2. Create Bastion Audit Log Directory
+      ansible.builtin.file:
+        path: /var/log/bastion
+        state: directory
+        mode: '0755'
+        owner: root
+
+    - name: 3. Ensure Chrony is enabled on boot
+      ansible.builtin.systemd:
+        name: chrony
+        enabled: yes
+        state: started
+
+    - name: 4-a. Ansible 컬렉션 로컬 tarball 존재 확인
+      ansible.builtin.find:
+        paths: "{{ playbook_dir }}/bastion-pkgs/galaxy"
+        patterns: "*.tar.gz"
+      register: galaxy_tarballs
+      become: false
+
+    - name: 4-b. Ansible 컬렉션 설치 (오프라인 - galaxy/ tarball 우선)
+      ansible.builtin.command: >
+        ansible-galaxy collection install {{ item.path }}
+      loop: "{{ galaxy_tarballs.files }}"
+      become: false
+      changed_when: true
+      when: galaxy_tarballs.files | length > 0
+
+    - name: 4-c. Ansible 컬렉션 설치 (온라인 fallback - tarball 없을 때)
+      ansible.builtin.command: >
+        ansible-galaxy collection install community.docker community.general
+      become: false
+      when: galaxy_tarballs.files | length == 0
+      register: galaxy_online
+      changed_when: "'installed' in galaxy_online.stdout"

@@ -1,0 +1,120 @@
+---
+# =================================================================
+# 01_common_setup.yml
+#
+# 서버 기본 구성용 플레이북
+#
+# =================================================================
+- name: Common System Infra Setup (All Nodes)
+  hosts: k8s:lb
+  become: yes
+  vars:
+    timezone: "Asia/Seoul"
+
+  tasks:
+    - name: 1. Disable restart popups (needrestart)
+      replace:
+        path: /etc/needrestart/needrestart.conf
+        regexp: "#\\$nrconf{restart} = 'i';"
+        replace: "$nrconf{restart} = 'a';"
+      ignore_errors: yes
+
+    - name: 1-b. Disable kernel hints popup (needrestart)
+      ansible.builtin.lineinfile:
+        path: /etc/needrestart/needrestart.conf
+        regexp: '^#?\$nrconf\{kernelhints\}'
+        line: "$nrconf{kernelhints} = -1;"
+        create: yes
+      ignore_errors: yes
+
+    - name: Update and Upgrade apt packages
+      apt:
+        update_cache: yes
+        upgrade: dist
+        cache_valid_time: 3600
+
+    - name: Install Essential Management Tools
+      apt:
+        name:
+          - jq
+          - curl
+          - git
+          - vim
+          - net-tools
+          - htop
+          - iptables
+          - chrony
+        state: present
+
+    - name: Disable Swap for Kubernetes and DB Performance
+      shell: |
+        swapoff -a
+      when: ansible_swaptotal_mb > 0
+
+    - name: Remove Swap entry from /etc/fstab (Persistence)
+      replace:
+        path: /etc/fstab
+        regexp: '^([^#].*?\sswap\s+.*)$'
+        replace: '# \1'
+
+    - name: Set iptables to Legacy (for Calico & K8s Stability)
+      ansible.builtin.command: >
+        update-alternatives --set {{ item }} /usr/sbin/{{ item }}-legacy
+      loop:
+        - iptables
+        - ip6tables
+      ignore_errors: yes
+
+    - name: Set Timezone to {{ timezone }}
+      ansible.builtin.command: timedatectl set-timezone {{ timezone }}
+
+    - name: Enable and Start Chrony (Time Sync)
+      ansible.builtin.systemd:  # 'systemctl'에서 'ansible.builtin.systemd'로 변경함
+        name: chrony
+        enabled: yes
+        state: started
+
+    # -------------------------------------------------------
+    # 배스천 퍼블릭키 주입 (kubeconfig fetch)
+    # -------------------------------------------------------
+    - name: Read bastion public key (run once)
+      delegate_to: localhost
+      run_once: true
+      become: false
+      shell: cat ~/.ssh/id_rsa.pub
+      register: bastion_pubkey
+
+    - name: Ensure .ssh directory exists
+      file:
+        path: "{{ ansible_env.HOME }}/.ssh"
+        state: directory
+        owner: "{{ ansible_user }}"
+        group: "{{ ansible_user }}"
+        mode: '0700'
+
+    - name: Add bastion public key to authorized_keys
+      authorized_key:
+        user: "{{ ansible_user }}"
+        key: "{{ bastion_pubkey.stdout }}"
+        state: present
+
+    - name: "miso.local DNS 설정 (systemd-resolved → CoreDNS)"
+      ansible.builtin.copy:
+        dest: /etc/systemd/resolved.conf.d/miso-local.conf
+        mode: "0644"
+        content: |
+          [Resolve]
+          DNS=10.96.0.10
+          Domains=~miso.local
+        owner: root
+        group: root
+      notify: Restart systemd-resolved
+
+    - name: Post-Installation Message
+      debug:
+        msg: "시스템 기초 설정이 완료되었습니다. 클러스터 구성 전 재부팅을 권장합니다."
+  handlers:
+    - name: Restart systemd-resolved
+      ansible.builtin.systemd:
+        name: systemd-resolved
+        state: restarted

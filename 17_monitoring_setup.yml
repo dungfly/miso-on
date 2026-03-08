@@ -1,0 +1,466 @@
+---
+# =================================================================
+# 17_monitoring_setup.yml
+# Prometheus + Grafana + AlertManager + Loki (Docker Compose)
+#
+# 실행: ansible-playbook -i hosts.ini 17_monitoring_setup.yml
+#
+# 옵션:
+#   재설치: ansible-playbook ... -e monitoring_action=reinstall
+#   제거  : ansible-playbook ... -e monitoring_action=remove
+#
+# 접속:
+#   Grafana      : https://monitor.miso.local      (admin/admin 초기, 19_ssl_setup 실행 후)
+#   Prometheus   : https://prometheus.miso.local   (19_ssl_setup 실행 후)
+#   AlertManager : https://alertmanager.miso.local (19_ssl_setup 실행 후)
+#   Loki         : http://10.1.5.100:3100          (내부 전용 - 직접 접속 불필요)
+# =================================================================
+
+- name: "모니터링 스택 구성 (Prometheus + Grafana + AlertManager + Loki)"
+  hosts: monitoring
+  become: yes
+  vars:
+    monitoring_action: "install"          # install / reinstall / remove
+    monitoring_base_dir: "/opt/monitoring"
+    monitoring_data_dir: "/data/monitoring"
+
+    grafana_admin_password: "misomonitor"  # 변경 권장
+    grafana_hostname: "monitor.miso.local"
+
+    # 수집 대상 K8s 노드 목록 (hosts.ini 기반 자동 생성)
+    k8s_nodes:
+      - { name: "master1",  ip: "10.1.2.10" }
+      - { name: "master2",  ip: "10.1.2.20" }
+      - { name: "master3",  ip: "10.1.2.30" }
+      - { name: "worker1",  ip: "10.1.3.10" }
+      - { name: "worker2",  ip: "10.1.3.20" }
+      - { name: "worker3",  ip: "10.1.3.30" }
+      - { name: "db1",      ip: "10.1.4.10" }
+      - { name: "db2",      ip: "10.1.4.20" }
+      - { name: "db3",      ip: "10.1.4.30" }
+      - { name: "harbor1",  ip: "10.1.5.10" }
+      - { name: "monitor1", ip: "10.1.5.100" }
+
+  tasks:
+    # ---------------------------------------------------------------
+    # 제거
+    # ---------------------------------------------------------------
+    - name: "모니터링 스택 제거"
+      ansible.builtin.shell: |
+        cd {{ monitoring_base_dir }}
+        docker compose down -v 2>/dev/null || true
+      when: monitoring_action in ['remove', 'reinstall']
+      failed_when: false
+
+    - name: "제거 완료 후 종료"
+      ansible.builtin.meta: end_play
+      when: monitoring_action == 'remove'
+
+    # ---------------------------------------------------------------
+    # STEP 1. Docker CE 설치
+    # ---------------------------------------------------------------
+    - name: "1-a. 로컬 저장소 확인 (A4에서 등록됐어야 함)"
+      ansible.builtin.stat:
+        path: /etc/apt/sources.list.d/miso-local-docker.list
+      register: docker_repo_check
+
+    - name: "1-b. 로컬 저장소 미등록 시 긴급 등록 (common + docker)"
+      ansible.builtin.copy:
+        dest: "{{ item.dest }}"
+        mode: "0644"
+        content: "{{ item.content }}"
+      loop:
+        - dest: /etc/apt/sources.list.d/miso-local-common.list
+          content: "deb [trusted=yes] http://10.1.5.10:8080/debs/common ./
+"
+        - dest: /etc/apt/sources.list.d/miso-local-docker.list
+          content: "deb [trusted=yes] http://10.1.5.10:8080/debs/docker ./
+"
+      when: not docker_repo_check.stat.exists
+
+    - name: "1-c. 필수 패키지 설치 (로컬 저장소 사용)"
+      ansible.builtin.apt:
+        name:
+          - ca-certificates
+          - curl
+          - gnupg
+        state: present
+        update_cache: yes
+
+    - name: "1-d. Docker CE 설치"
+      ansible.builtin.apt:
+        name:
+          - docker-ce
+          - docker-ce-cli
+          - containerd.io
+          - docker-compose-plugin
+        state: present
+        update_cache: yes
+
+    - name: "1-e. Docker 서비스 활성화"
+      ansible.builtin.systemd:
+        name: docker
+        state: started
+        enabled: yes
+
+    # ---------------------------------------------------------------
+    # STEP 2. 디렉토리 및 설정 파일 생성
+    # ---------------------------------------------------------------
+    - name: "2. 디렉토리 생성"
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        mode: "0755"
+      loop:
+        - "{{ monitoring_base_dir }}"
+        - "{{ monitoring_base_dir }}/prometheus"
+        - "{{ monitoring_base_dir }}/alertmanager"
+        - "{{ monitoring_base_dir }}/grafana/provisioning/datasources"
+        - "{{ monitoring_base_dir }}/grafana/provisioning/dashboards"
+        - "{{ monitoring_base_dir }}/loki"
+        - "{{ monitoring_data_dir }}/prometheus"
+        - "{{ monitoring_data_dir }}/grafana"
+        - "{{ monitoring_data_dir }}/loki"
+
+    - name: "2-a. Prometheus 설정"
+      ansible.builtin.copy:
+        dest: "{{ monitoring_base_dir }}/prometheus/prometheus.yml"
+        mode: "0644"
+        content: |
+          global:
+            scrape_interval: 15s
+            evaluation_interval: 15s
+
+          alerting:
+            alertmanagers:
+              - static_configs:
+                  - targets: ['alertmanager:9093']
+
+          rule_files:
+            - /etc/prometheus/rules/*.yml
+
+          scrape_configs:
+            # Prometheus 자기자신
+            - job_name: 'prometheus'
+              static_configs:
+                - targets: ['localhost:9090']
+
+            # 전체 노드 node-exporter
+            - job_name: 'node-exporter'
+              static_configs:
+                - targets:
+                  {% for node in k8s_nodes %}
+                  - '{{ node.ip }}:9100'
+                  {% endfor %}
+                  labels:
+                    env: 'miso'
+
+            # Harbor
+            - job_name: 'harbor'
+              static_configs:
+                - targets: ['10.1.5.10:9090']
+              metrics_path: /metrics
+
+            # PostgreSQL (CNPG exporter)
+            - job_name: 'postgresql'
+              static_configs:
+                - targets: ['10.1.1.10:9187']
+
+            # Redis
+            - job_name: 'redis'
+              static_configs:
+                - targets: ['10.1.1.10:9121']
+
+            # MinIO
+            - job_name: 'minio'
+              static_configs:
+                - targets: ['10.1.1.10:9000']
+              metrics_path: /minio/v2/metrics/cluster
+
+    - name: "2-b. AlertManager 설정"
+      ansible.builtin.copy:
+        dest: "{{ monitoring_base_dir }}/alertmanager/alertmanager.yml"
+        mode: "0644"
+        content: |
+          global:
+            resolve_timeout: 5m
+
+          route:
+            group_by: ['alertname', 'job']
+            group_wait: 30s
+            group_interval: 5m
+            repeat_interval: 12h
+            receiver: 'default'
+
+          receivers:
+            - name: 'default'
+              # 슬랙/이메일 연동 시 여기에 추가
+              # slack_configs:
+              #   - api_url: 'https://hooks.slack.com/...'
+              #     channel: '#alerts'
+
+          inhibit_rules:
+            - source_match:
+                severity: 'critical'
+              target_match:
+                severity: 'warning'
+              equal: ['alertname']
+
+    - name: "2-c. Loki 설정"
+      ansible.builtin.copy:
+        dest: "{{ monitoring_base_dir }}/loki/loki-config.yml"
+        mode: "0644"
+        content: |
+          auth_enabled: false
+
+          server:
+            http_listen_port: 3100
+
+          ingester:
+            wal:
+              enabled: false
+            lifecycler:
+              ring:
+                kvstore:
+                  store: inmemory
+                replication_factor: 1
+              final_sleep: 0s
+            chunk_idle_period: 1h
+            max_chunk_age: 1h
+            chunk_retain_period: 30s
+
+          schema_config:
+            configs:
+              - from: 2024-01-01
+                store: boltdb-shipper
+                object_store: filesystem
+                schema: v11
+                index:
+                  prefix: index_
+                  period: 24h
+
+          storage_config:
+            boltdb_shipper:
+              active_index_directory: /loki/index
+              cache_location: /loki/cache
+              shared_store: filesystem
+            filesystem:
+              directory: /loki/chunks
+
+          limits_config:
+            retention_period: 168h    # 7일
+
+          compactor:
+            working_directory: /loki/compactor
+            shared_store: filesystem
+            retention_enabled: true
+            retention_delete_delay: 2h
+            retention_delete_worker_count: 150
+
+          chunk_store_config:
+            max_look_back_period: 168h  # 7일
+
+          table_manager:
+            retention_deletes_enabled: true
+            retention_period: 168h      # 7일
+
+    - name: "2-e. Grafana datasource 자동 프로비저닝"
+      ansible.builtin.copy:
+        dest: "{{ monitoring_base_dir }}/grafana/provisioning/datasources/datasources.yml"
+        mode: "0644"
+        content: |
+          apiVersion: 1
+          datasources:
+            - name: Prometheus
+              type: prometheus
+              access: proxy
+              url: http://prometheus:9090
+              isDefault: true
+              editable: true
+
+            - name: Loki
+              type: loki
+              access: proxy
+              url: http://loki:3100
+              editable: true
+
+            - name: AlertManager
+              type: alertmanager
+              access: proxy
+              url: http://alertmanager:9093
+              editable: true
+
+    - name: "2-f. Grafana dashboard 프로비저닝 설정"
+      ansible.builtin.copy:
+        dest: "{{ monitoring_base_dir }}/grafana/provisioning/dashboards/dashboards.yml"
+        mode: "0644"
+        content: |
+          apiVersion: 1
+          providers:
+            - name: 'default'
+              orgId: 1
+              folder: 'MISO'
+              type: file
+              disableDeletion: false
+              updateIntervalSeconds: 30
+              options:
+                path: /var/lib/grafana/dashboards
+
+    # ---------------------------------------------------------------
+    # STEP 3. Docker Compose 파일 생성 및 실행
+    # ---------------------------------------------------------------
+    - name: "3. docker-compose.yml 생성"
+      ansible.builtin.copy:
+        dest: "{{ monitoring_base_dir }}/docker-compose.yml"
+        mode: "0644"
+        content: |
+          version: '3.8'
+
+          networks:
+            monitoring:
+              driver: bridge
+
+          volumes:
+            prometheus_data:
+              driver: local
+              driver_opts:
+                type: none
+                o: bind
+                device: {{ monitoring_data_dir }}/prometheus
+            grafana_data:
+              driver: local
+              driver_opts:
+                type: none
+                o: bind
+                device: {{ monitoring_data_dir }}/grafana
+            loki_data:
+              driver: local
+              driver_opts:
+                type: none
+                o: bind
+                device: {{ monitoring_data_dir }}/loki
+
+          services:
+            prometheus:
+              image: harbor.miso.local/miso/prometheus:v2.51.0
+              container_name: prometheus
+              restart: unless-stopped
+              ports:
+                - "9090:9090"
+              volumes:
+                - {{ monitoring_base_dir }}/prometheus:/etc/prometheus
+                - prometheus_data:/prometheus
+              command:
+                - '--config.file=/etc/prometheus/prometheus.yml'
+                - '--storage.tsdb.path=/prometheus'
+                - '--storage.tsdb.retention.time=30d'
+                - '--web.enable-lifecycle'
+              networks:
+                - monitoring
+
+            grafana:
+              image: harbor.miso.local/miso/grafana:10.4.2
+              container_name: grafana
+              restart: unless-stopped
+              ports:
+                - "3000:3000"
+              environment:
+                - GF_SECURITY_ADMIN_PASSWORD={{ grafana_admin_password }}
+                - GF_USERS_ALLOW_SIGN_UP=false
+                - GF_SERVER_DOMAIN={{ grafana_hostname }}
+              volumes:
+                - grafana_data:/var/lib/grafana
+                - {{ monitoring_base_dir }}/grafana/provisioning:/etc/grafana/provisioning
+              networks:
+                - monitoring
+
+            alertmanager:
+              image: harbor.miso.local/miso/alertmanager:v0.27.0
+              container_name: alertmanager
+              restart: unless-stopped
+              ports:
+                - "9093:9093"
+              volumes:
+                - {{ monitoring_base_dir }}/alertmanager:/etc/alertmanager
+              command:
+                - '--config.file=/etc/alertmanager/alertmanager.yml'
+                - '--storage.path=/alertmanager'
+              networks:
+                - monitoring
+
+            loki:
+              image: harbor.miso.local/miso/loki:2.9.8
+              container_name: loki
+              restart: unless-stopped
+              ports:
+                - "3100:3100"
+              volumes:
+                - {{ monitoring_base_dir }}/loki:/etc/loki
+                - loki_data:/loki
+              command: -config.file=/etc/loki/loki-config.yml
+              networks:
+                - monitoring
+
+            node-exporter:
+              image: harbor.miso.local/miso/node-exporter:v1.7.0
+              container_name: node-exporter
+              restart: unless-stopped
+              network_mode: host
+              pid: host
+              volumes:
+                - /proc:/host/proc:ro
+                - /sys:/host/sys:ro
+                - /:/host/root:ro,rslave
+              command:
+                - '--path.procfs=/host/proc'
+                - '--path.sysfs=/host/sys'
+                - '--path.rootfs=/host/root'
+                - '--collector.filesystem.mount-points-exclude=^/(sys|proc|dev|host|etc)($$|/)'
+
+    - name: "4. data 디렉토리 권한 설정 (grafana uid 472)"
+      ansible.builtin.file:
+        path: "{{ monitoring_data_dir }}/grafana"
+        owner: "472"
+        group: "472"
+        recurse: yes
+
+    - name: "5. 모니터링 스택 기동"
+      ansible.builtin.shell: |
+        cd {{ monitoring_base_dir }}
+        docker compose up -d
+      changed_when: true
+
+    - name: "6. 서비스 기동 대기 (최대 2분)"
+      ansible.builtin.uri:
+        url: "http://{{ ansible_host }}:3000/api/health"
+        status_code: 200
+      register: grafana_health
+      until: grafana_health.status == 200
+      retries: 24
+      delay: 5
+
+# ---------------------------------------------------------------
+# 완료 요약
+# ---------------------------------------------------------------
+- name: "모니터링 구성 완료 요약"
+  hosts: bastion
+  become: no
+  gather_facts: false
+  tasks:
+    - name: "완료 안내"
+      ansible.builtin.debug:
+        msg:
+          - "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          - " 모니터링 구성 완료"
+          - "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          - " Grafana      : https://monitor.miso.local      (19_ssl_setup 실행 후)"
+          - " Prometheus   : https://prometheus.miso.local   (19_ssl_setup 실행 후)"
+          - " AlertManager : https://alertmanager.miso.local (19_ssl_setup 실행 후)"
+          - " Loki         : http://10.1.5.100:3100          (내부 전용 - 직접 접속 불필요)"
+          - ""
+          - " Grafana 계정 : admin / misomonitor  ← 변경 권장"
+          - " 로그 보존    : 7일"
+          - ""
+          - " 재설치: ansible-playbook -i hosts.ini 17_monitoring_setup.yml -e monitoring_action=reinstall"
+          - " 제거  : ansible-playbook -i hosts.ini 17_monitoring_setup.yml -e monitoring_action=remove"
+          - "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"

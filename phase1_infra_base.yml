@@ -1,0 +1,10 @@
+---
+# =================================================================
+# PHASE 1 - 인프라 기초 설정
+#
+# 실행: ansible-playbook -i hosts.ini phase1_infra_base.yml
+# 소요: 약 15분 (재부팅 포함)
+# =================================================================
+- import_playbook: 01_common_setup.yml
+- import_playbook: 02_lb_setup_2.yml
+

@@ -1,0 +1,9 @@
+---
+# =================================================================
+# PHASE 7 - 모니터링
+#
+# 실행: ansible-playbook -i hosts.ini phase7_monitoring.yml
+# 소요: 약 10분
+# =================================================================
+- import_playbook: 17_monitoring_setup.yml
+- import_playbook: 17.5_node_exporter.yml

@@ -1,0 +1,252 @@
+---
+# =================================================================
+# 99_healthcheck.yml - 전체 클러스터 상태 점검
+#
+# 실행: ansible-playbook -i hosts.ini 99_healthcheck.yml
+#
+# 점검 항목:
+#   [1] K8s 노드 상태 (all Ready)
+#   [2] 시스템 Pod 상태 (kube-system)
+#   [3] 데이터 서비스 Pod (PostgreSQL / Redis / OpenSearch / MinIO)
+#   [4] Ingress Controller NodePort (30080 / 30443)
+#   [5] CoreDNS *.miso.local rewrite 항목
+#   [6] PostgreSQL 클러스터 상태 (CNPG)
+#   [7] Redis Sentinel 상태
+#   [8] OpenSearch 클러스터 health
+#   [9] Harbor / ArgoCD URL 응답
+#  [10] PVC 바인딩 상태
+# =================================================================
+
+- name: "전체 클러스터 헬스체크"
+  hosts: bastion
+  become: no
+  gather_facts: false
+  environment:
+    KUBECONFIG: "{{ lookup('env', 'HOME') }}/.kube/config"
+  vars:
+    os_admin_password: "MisoAdmin1!"
+    pg_cluster_name: "miso-db"
+    redis_name: "miso-redis"
+    os_name: "miso-opensearch"
+
+  tasks:
+    # ------------------------------------------------------------------
+    # [1] K8s 노드 상태
+    # ------------------------------------------------------------------
+    - name: "[1] K8s 노드 목록 및 상태"
+      ansible.builtin.command: kubectl get nodes -o wide
+      register: nodes_status
+      changed_when: false
+
+    - name: "[1] 노드 상태 출력"
+      ansible.builtin.debug:
+        msg: "{{ nodes_status.stdout_lines }}"
+
+    - name: "[1] NotReady 노드 감지"
+      ansible.builtin.shell: |
+        NOT_READY=$(kubectl get nodes --no-headers | grep -v " Ready" | wc -l)
+        [ "$NOT_READY" -eq 0 ] && echo "OK: 모든 노드 Ready" || echo "WARN: NotReady 노드 ${NOT_READY}개 존재"
+      register: node_check
+      changed_when: false
+
+    - name: "[1] 노드 Ready 결과"
+      ansible.builtin.debug:
+        msg: "{{ node_check.stdout_lines }}"
+
+    # ------------------------------------------------------------------
+    # [2] 시스템 Pod 상태
+    # ------------------------------------------------------------------
+    - name: "[2] kube-system 비정상 Pod 감지"
+      ansible.builtin.shell: |
+        kubectl get pods -n kube-system -o wide
+        NOT_RUNNING=$(kubectl get pods -n kube-system --no-headers \
+          | grep -v " Running\| Completed" | wc -l)
+        [ "$NOT_RUNNING" -eq 0 ] && echo "OK: kube-system 전체 정상" \
+          || echo "WARN: 비정상 Pod ${NOT_RUNNING}개"
+      register: system_pods
+      changed_when: false
+
+    - name: "[2] 시스템 Pod 결과"
+      ansible.builtin.debug:
+        msg: "{{ system_pods.stdout_lines }}"
+
+    # ------------------------------------------------------------------
+    # [3] 데이터 서비스 Pod 상태
+    # ------------------------------------------------------------------
+    - name: "[3] 데이터 서비스 Pod 전체"
+      ansible.builtin.shell: |
+        echo "=== PostgreSQL (CNPG) ==="
+        kubectl get pods -l cnpg.io/cluster={{ pg_cluster_name }} -o wide 2>/dev/null || echo "  (없음)"
+        echo ""
+        echo "=== Redis ==="
+        kubectl get pods -l app={{ redis_name }} -o wide 2>/dev/null || echo "  (없음)"
+        echo ""
+        echo "=== OpenSearch ==="
+        kubectl get pods -l app={{ os_name }} -o wide 2>/dev/null || echo "  (없음)"
+        kubectl get pods -l app={{ os_name }}-dashboards -o wide 2>/dev/null || true
+        echo ""
+        echo "=== MinIO ==="
+        kubectl get pods -l app=minio -o wide 2>/dev/null || echo "  (없음)"
+      register: data_pods
+      changed_when: false
+
+    - name: "[3] 데이터 서비스 Pod 결과"
+      ansible.builtin.debug:
+        msg: "{{ data_pods.stdout_lines }}"
+
+    # ------------------------------------------------------------------
+    # [4] Ingress NodePort 확인
+    # ------------------------------------------------------------------
+    - name: "[4] Ingress Controller NodePort 확인"
+      ansible.builtin.shell: |
+        PORTS=$(kubectl get svc ingress-nginx-controller -n ingress-nginx \
+          -o jsonpath='{.spec.ports[*].nodePort}' 2>/dev/null)
+        echo "현재 NodePort: $PORTS"
+        echo "$PORTS" | grep -q "30080" && echo "  HTTP (30080): OK" || echo "  HTTP (30080): WARN"
+        echo "$PORTS" | grep -q "30443" && echo "  HTTPS (30443): OK" || echo "  HTTPS (30443): WARN"
+      register: ingress_ports
+      changed_when: false
+      failed_when: false
+
+    - name: "[4] Ingress NodePort 결과"
+      ansible.builtin.debug:
+        msg: "{{ ingress_ports.stdout_lines }}"
+
+    # ------------------------------------------------------------------
+    # [5] CoreDNS rewrite 항목
+    # ------------------------------------------------------------------
+    - name: "[5] CoreDNS *.miso.local 설정 확인"
+      ansible.builtin.shell: |
+        echo "=== CoreDNS miso.local 항목 ==="
+        kubectl get configmap coredns -n kube-system \
+          -o jsonpath='{.data.Corefile}' \
+          | grep -E "miso\.local|rewrite" || echo "  (설정 없음)"
+      register: coredns_check
+      changed_when: false
+
+    - name: "[5] CoreDNS 설정 결과"
+      ansible.builtin.debug:
+        msg: "{{ coredns_check.stdout_lines }}"
+
+    # ------------------------------------------------------------------
+    # [6] PostgreSQL 클러스터 (CNPG)
+    # ------------------------------------------------------------------
+    - name: "[6] CNPG PostgreSQL 클러스터 상태"
+      ansible.builtin.shell: |
+        echo "=== Cluster ==="
+        kubectl get cluster {{ pg_cluster_name }} 2>/dev/null || echo "  클러스터 없음"
+        echo ""
+        echo "=== Services ==="
+        kubectl get svc | grep {{ pg_cluster_name }} 2>/dev/null || echo "  서비스 없음"
+        echo ""
+        echo "=== PVC ==="
+        kubectl get pvc -l cnpg.io/cluster={{ pg_cluster_name }} 2>/dev/null || echo "  PVC 없음"
+      register: pg_status
+      changed_when: false
+      failed_when: false
+
+    - name: "[6] PostgreSQL 상태 출력"
+      ansible.builtin.debug:
+        msg: "{{ pg_status.stdout_lines }}"
+
+    # ------------------------------------------------------------------
+    # [7] Redis Sentinel 상태
+    # ------------------------------------------------------------------
+    - name: "[7] Redis Sentinel 상태 확인"
+      ansible.builtin.shell: |
+        echo "=== Redis Data Pods ==="
+        kubectl get pods -l "app={{ redis_name }},role=redis" -o wide 2>/dev/null || echo "  (없음)"
+        echo ""
+        echo "=== Sentinel Pods ==="
+        kubectl get pods -l "app={{ redis_name }},role=sentinel" -o wide 2>/dev/null || echo "  (없음)"
+        echo ""
+        echo "=== Sentinel Master ==="
+        kubectl exec {{ redis_name }}-sentinel-0 -- \
+          redis-cli -p 26379 sentinel master miso-redis-master 2>/dev/null \
+          | grep -E "^name|^ip|^port|^flags" || echo "  Sentinel 접속 불가"
+      register: redis_status
+      changed_when: false
+      failed_when: false
+
+    - name: "[7] Redis 상태 출력"
+      ansible.builtin.debug:
+        msg: "{{ redis_status.stdout_lines }}"
+
+    # ------------------------------------------------------------------
+    # [8] OpenSearch 클러스터 health
+    # ------------------------------------------------------------------
+    - name: "[8] OpenSearch 클러스터 health"
+      ansible.builtin.shell: |
+        kubectl exec {{ os_name }}-0 -- \
+          curl -sk https://localhost:9200/_cluster/health?pretty \
+          -u admin:{{ os_admin_password }} 2>/dev/null || echo "접속 불가"
+      register: os_health
+      changed_when: false
+      failed_when: false
+
+    - name: "[8] OpenSearch health 결과"
+      ansible.builtin.debug:
+        msg: "{{ os_health.stdout_lines }}"
+
+    # ------------------------------------------------------------------
+    # [9] 외부 URL 응답
+    # ------------------------------------------------------------------
+    - name: "[9] Harbor API 응답"
+      ansible.builtin.uri:
+        url: "https://harbor.miso.local/api/v2.0/health"
+        validate_certs: no
+        timeout: 5
+      register: harbor_health
+      failed_when: false
+      changed_when: false
+
+    - name: "[9] Harbor 응답 결과"
+      ansible.builtin.debug:
+        msg: "Harbor HTTP {{ harbor_health.status | default('응답없음') }}"
+
+    - name: "[9] ArgoCD 응답"
+      ansible.builtin.uri:
+        url: "https://argocd.miso.local"
+        validate_certs: no
+        timeout: 5
+      register: argocd_health
+      failed_when: false
+      changed_when: false
+
+    - name: "[9] ArgoCD 응답 결과"
+      ansible.builtin.debug:
+        msg: "ArgoCD HTTP {{ argocd_health.status | default('응답없음') }}"
+
+    # ------------------------------------------------------------------
+    # [10] PVC 바인딩 상태
+    # ------------------------------------------------------------------
+    - name: "[10] PVC 바인딩 상태"
+      ansible.builtin.shell: |
+        echo "=== 전체 PVC ==="
+        kubectl get pvc -A
+        UNBOUND=$(kubectl get pvc -A --no-headers | grep -v "Bound" | wc -l)
+        [ "$UNBOUND" -eq 0 ] && echo "OK: 모든 PVC Bound" \
+          || echo "WARN: 미바인딩 PVC ${UNBOUND}개 존재"
+      register: pvc_status
+      changed_when: false
+
+    - name: "[10] PVC 상태 출력"
+      ansible.builtin.debug:
+        msg: "{{ pvc_status.stdout_lines }}"
+
+    # ------------------------------------------------------------------
+    # 요약
+    # ------------------------------------------------------------------
+    - name: "헬스체크 완료 안내"
+      ansible.builtin.debug:
+        msg:
+          - "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          - " 헬스체크 완료 - OK / WARN 로 결과를 확인하세요"
+          - "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          - " 주요 서비스 접속 URL:"
+          - "  https://harbor.miso.local      Harbor"
+          - "  https://argocd.miso.local      ArgoCD"
+          - "  https://monitor.miso.local     Grafana"
+          - "  https://dashboard.miso.local   OpenSearch Dashboards"
+          - "  https://s3console.miso.local   MinIO Console"
+          - "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"

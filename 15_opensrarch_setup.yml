@@ -1,0 +1,835 @@
+---
+# =================================================================
+# 15_opensearch_setup.yml
+#
+# 목적: OpenSearch 2.x 클러스터 설치 (cert-manager SSL 적용)
+#
+# 구성 (POC/운영 공통):
+#   Master+Data 겸용 x3 → db_nodes 각 1개씩
+#   JVM 힙: 2GB (POC) → 운영 시 -e os_jvm_heap=16g
+#   스토리지: 100Gi
+#   SSL: cert-manager internal-ca-issuer (Transport + HTTP)
+#
+# 운영 구성 (참고):
+#   Dedicated Master x3 (JVM 4GB)
+#   Data Node x2       (JVM 16GB)
+#
+# 선행 조건:
+#   - 07_cert_setup.yml (cert-manager + internal-ca-issuer 설치)
+#   - 10_db_node_join.yml (db_nodes K8s 조인)
+#   - 11_db_node_tune.yml (vm.max_map_count=262144)
+#
+# 실행:
+#   기본        : ansible-playbook -i hosts.ini 15_opensearch_setup.yml
+#   재설치      : ansible-playbook -i hosts.ini 15_opensearch_setup.yml -e force_reinstall=true
+#   JVM 변경    : ansible-playbook -i hosts.ini 15_opensearch_setup.yml -e os_jvm_heap=16g
+#   제거(PVC보존): ansible-playbook -i hosts.ini 15_opensearch_setup.yml -e os_action=remove
+#   완전 삭제   : ansible-playbook -i hosts.ini 15_opensearch_setup.yml -e os_action=purge
+# =================================================================
+
+- name: "OpenSearch 2.x 클러스터 설치 (SSL)"
+  hosts: bastion
+  become: no
+  environment:
+    KUBECONFIG: "{{ lookup('env', 'HOME') }}/.kube/config"
+  gather_facts: false
+
+  vars:
+    os_namespace: "default"
+    os_name: "miso-opensearch"
+    os_action: "install"          # install / remove (PVC 보존) / purge (완전 삭제)
+
+    # 이미지
+    os_image: "harbor.miso.local/miso/opensearch:2.19.1"
+    os_dashboard_image: "harbor.miso.local/miso/opensearch-dashboards:2.19.1"
+
+    # 클러스터 설정
+    os_replicas: 3
+    os_cluster_name: "miso-opensearch"
+
+    # JVM 힙 메모리 (POC: 2g, 운영 Master: 4g, 운영 Data: 16g)
+    os_jvm_heap: "2g"
+    os_memory_request: "4Gi"
+    os_memory_limit: "4Gi"
+
+    # 스토리지
+    os_storage_size: "20Gi"
+    os_storageclass: "local-path"
+
+    # 자격증명
+    os_admin_password: "MisoAdmin1!"
+
+    # cert-manager 설정
+    cert_issuer: "internal-ca-issuer"
+    cert_issuer_kind: "ClusterIssuer"
+
+    # db_nodes 배치
+    db_node_label_key: "node-role.kubernetes.io/db"
+    db_node_label_value: "true"
+    db_node_taint_key: "dedicated"
+    db_node_taint_value: "db"
+
+  tasks:
+    # -----------------------------------------------------------------
+    # STEP 0. 제거 모드
+    # -----------------------------------------------------------------
+    - name: "0. [remove] OpenSearch 리소스 제거 (PVC 보존)"
+      ansible.builtin.shell: |
+        kubectl delete statefulset {{ os_name }} -n {{ os_namespace }} --ignore-not-found=true
+        kubectl delete deployment {{ os_name }}-dashboards -n {{ os_namespace }} --ignore-not-found=true
+        kubectl delete service {{ os_name }} {{ os_name }}-headless {{ os_name }}-dashboards \
+          -n {{ os_namespace }} --ignore-not-found=true
+        kubectl delete configmap {{ os_name }}-config -n {{ os_namespace }} --ignore-not-found=true
+        kubectl delete secret {{ os_name }}-auth -n {{ os_namespace }} --ignore-not-found=true
+        kubectl delete certificate {{ os_name }}-transport-cert {{ os_name }}-http-cert \
+          -n {{ os_namespace }} --ignore-not-found=true
+        echo "제거 완료 (PVC + 인증서 Secret 보존)"
+        kubectl get pvc -n {{ os_namespace }} | grep {{ os_name }} || echo "  PVC 없음"
+      when: os_action == 'remove'
+      register: remove_out
+      changed_when: true
+
+    - name: "0. [remove] 제거 결과"
+      ansible.builtin.debug:
+        msg: "{{ remove_out.stdout_lines | default([]) }}"
+      when: os_action == 'remove'
+
+    - name: "0. [purge] OpenSearch 리소스 + PVC 완전 삭제"
+      ansible.builtin.shell: |
+        kubectl delete statefulset {{ os_name }} -n {{ os_namespace }} --ignore-not-found=true
+        kubectl delete deployment {{ os_name }}-dashboards -n {{ os_namespace }} --ignore-not-found=true
+        kubectl delete service {{ os_name }} {{ os_name }}-headless {{ os_name }}-dashboards \
+          -n {{ os_namespace }} --ignore-not-found=true
+        kubectl delete configmap {{ os_name }}-config -n {{ os_namespace }} --ignore-not-found=true
+        kubectl delete secret {{ os_name }}-auth \
+          {{ os_name }}-transport-tls {{ os_name }}-http-tls \
+          -n {{ os_namespace }} --ignore-not-found=true
+        kubectl delete certificate {{ os_name }}-transport-cert {{ os_name }}-http-cert \
+          -n {{ os_namespace }} --ignore-not-found=true
+        sleep 3
+        kubectl delete pvc -n {{ os_namespace }} -l app={{ os_name }} --ignore-not-found=true
+        echo "완전 삭제 완료"
+      when: os_action == 'purge'
+      register: purge_out
+      changed_when: true
+
+    - name: "0. [purge] 완전 삭제 결과"
+      ansible.builtin.debug:
+        msg: "{{ purge_out.stdout_lines | default([]) }}"
+      when: os_action == 'purge'
+
+    - name: "0. 제거/삭제 완료 후 종료"
+      ansible.builtin.meta: end_play
+      when: os_action in ['remove', 'purge']
+
+    # -----------------------------------------------------------------
+    # STEP 1. 기존 리소스 확인
+    # -----------------------------------------------------------------
+    - name: "1. 기존 OpenSearch StatefulSet 존재 여부 확인"
+      ansible.builtin.shell: |
+        kubectl get statefulset {{ os_name }} -n {{ os_namespace }} \
+          --no-headers 2>/dev/null | wc -l
+      register: os_exists
+      changed_when: false
+
+    - name: "1. [force_reinstall] 기존 리소스 제거 (PVC 보존)"
+      ansible.builtin.shell: |
+        kubectl delete statefulset {{ os_name }} -n {{ os_namespace }} --ignore-not-found=true
+        kubectl delete deployment {{ os_name }}-dashboards -n {{ os_namespace }} --ignore-not-found=true
+        kubectl delete service {{ os_name }} {{ os_name }}-headless {{ os_name }}-dashboards \
+          -n {{ os_namespace }} --ignore-not-found=true
+        kubectl delete configmap {{ os_name }}-config -n {{ os_namespace }} --ignore-not-found=true
+        for i in $(seq 1 30); do
+          COUNT=$(kubectl get pods -n {{ os_namespace }} -l app={{ os_name }} \
+            --no-headers 2>/dev/null | wc -l)
+          [ "$COUNT" -eq 0 ] && echo "Pod 종료 완료" && break
+          echo "대기 중... (${COUNT}개)"
+          sleep 5
+        done
+      when:
+        - force_reinstall | default(false) | bool
+        - os_exists.stdout | trim | int > 0
+      register: force_remove
+      changed_when: true
+
+    # -----------------------------------------------------------------
+    # STEP 2. Secret 생성
+    # -----------------------------------------------------------------
+    - name: "2. OpenSearch 자격증명 Secret 생성"
+      ansible.builtin.shell: |
+        kubectl create secret generic {{ os_name }}-auth \
+          -n {{ os_namespace }} \
+          --from-literal=admin-password={{ os_admin_password }} \
+          --dry-run=client -o yaml | kubectl apply -f -
+      register: secret_out
+      changed_when: "'created' in secret_out.stdout or 'configured' in secret_out.stdout"
+
+    # -----------------------------------------------------------------
+    # STEP 3. cert-manager Certificate 생성 (Transport + HTTP)
+    # -----------------------------------------------------------------
+    - name: "3-a. OpenSearch 인증서 매니페스트 생성"
+      ansible.builtin.copy:
+        dest: /tmp/opensearch-certs.yaml
+        mode: "0644"
+        content: |
+          apiVersion: cert-manager.io/v1
+          kind: Certificate
+          metadata:
+            name: {{ os_name }}-transport-cert
+            namespace: {{ os_namespace }}
+          spec:
+            secretName: {{ os_name }}-transport-tls
+            duration: 8760h
+            renewBefore: 720h
+            commonName: {{ os_name }}
+            dnsNames:
+              - {{ os_name }}-0.{{ os_name }}-headless.{{ os_namespace }}.svc.cluster.local
+              - {{ os_name }}-1.{{ os_name }}-headless.{{ os_namespace }}.svc.cluster.local
+              - {{ os_name }}-2.{{ os_name }}-headless.{{ os_namespace }}.svc.cluster.local
+              - {{ os_name }}-headless.{{ os_namespace }}.svc.cluster.local
+              - {{ os_name }}.{{ os_namespace }}.svc.cluster.local
+            issuerRef:
+              name: {{ cert_issuer }}
+              kind: {{ cert_issuer_kind }}
+          ---
+          apiVersion: cert-manager.io/v1
+          kind: Certificate
+          metadata:
+            name: {{ os_name }}-http-cert
+            namespace: {{ os_namespace }}
+          spec:
+            secretName: {{ os_name }}-http-tls
+            duration: 8760h
+            renewBefore: 720h
+            commonName: {{ os_name }}
+            dnsNames:
+              - opensearch.miso.local
+              - {{ os_name }}.{{ os_namespace }}.svc.cluster.local
+              - {{ os_name }}-headless.{{ os_namespace }}.svc.cluster.local
+              - localhost
+            issuerRef:
+              name: {{ cert_issuer }}
+              kind: {{ cert_issuer_kind }}
+
+    - name: "3-b. OpenSearch 인증서 적용"
+      ansible.builtin.command: kubectl apply -f /tmp/opensearch-certs.yaml
+      register: cert_out
+      changed_when: "'created' in cert_out.stdout or 'configured' in cert_out.stdout"
+
+    - name: "3-c. 인증서 생성 결과"
+      ansible.builtin.debug:
+        msg: "{{ cert_out.stdout_lines }}"
+
+    - name: "3-d. 임시 인증서 파일 정리"
+      ansible.builtin.file:
+        path: /tmp/opensearch-certs.yaml
+        state: absent
+
+    - name: "3. Transport 인증서 Secret 준비 대기"
+      ansible.builtin.shell: |
+        kubectl get secret {{ os_name }}-transport-tls \
+          -n {{ os_namespace }} --no-headers 2>/dev/null | wc -l
+      register: transport_secret
+      until: transport_secret.stdout | trim | int > 0
+      retries: 30
+      delay: 5
+      changed_when: false
+
+    - name: "3. HTTP 인증서 Secret 준비 대기"
+      ansible.builtin.shell: |
+        kubectl get secret {{ os_name }}-http-tls \
+          -n {{ os_namespace }} --no-headers 2>/dev/null | wc -l
+      register: http_secret
+      until: http_secret.stdout | trim | int > 0
+      retries: 30
+      delay: 5
+      changed_when: false
+
+    - name: "3. 인증서 발급 확인"
+      ansible.builtin.shell: |
+        echo "=== Transport 인증서 ==="
+        kubectl get certificate {{ os_name }}-transport-cert -n {{ os_namespace }}
+        echo "=== HTTP 인증서 ==="
+        kubectl get certificate {{ os_name }}-http-cert -n {{ os_namespace }}
+      register: cert_status
+      changed_when: false
+
+    - name: "3. 인증서 상태 출력"
+      ansible.builtin.debug:
+        msg: "{{ cert_status.stdout_lines }}"
+
+    # -----------------------------------------------------------------
+    # STEP 4. ConfigMap 생성 (opensearch.yml + jvm.options)
+    # -----------------------------------------------------------------
+    - name: "4-a. OpenSearch ConfigMap 파일 생성"
+      ansible.builtin.copy:
+        dest: /tmp/opensearch-configmap.yaml
+        mode: "0644"
+        content: |
+          apiVersion: v1
+          kind: ConfigMap
+          metadata:
+            name: {{ os_name }}-config
+            namespace: {{ os_namespace }}
+          data:
+            opensearch.yml: |
+              cluster.name: {{ os_cluster_name }}
+              network.host: 0.0.0.0
+
+              discovery.seed_hosts:
+                - {{ os_name }}-0.{{ os_name }}-headless.{{ os_namespace }}.svc.cluster.local
+                - {{ os_name }}-1.{{ os_name }}-headless.{{ os_namespace }}.svc.cluster.local
+                - {{ os_name }}-2.{{ os_name }}-headless.{{ os_namespace }}.svc.cluster.local
+              cluster.initial_cluster_manager_nodes:
+                - {{ os_name }}-0
+                - {{ os_name }}-1
+                - {{ os_name }}-2
+
+              node.roles: [cluster_manager, data, ingest]
+
+              plugins.security.disabled: false
+
+              plugins.security.ssl.transport.pemcert_filepath: transport-tls.crt
+              plugins.security.ssl.transport.pemkey_filepath: transport-tls.key
+              plugins.security.ssl.transport.pemtrustedcas_filepath: transport-ca.crt
+              plugins.security.ssl.transport.enforce_hostname_verification: false
+
+              plugins.security.ssl.http.enabled: true
+              plugins.security.ssl.http.pemcert_filepath: http-tls.crt
+              plugins.security.ssl.http.pemkey_filepath: http-tls.key
+              plugins.security.ssl.http.pemtrustedcas_filepath: http-ca.crt
+
+              plugins.security.authcz.admin_dn:
+                - "CN={{ os_name }}"
+              plugins.security.nodes_dn:
+                - "CN={{ os_name }}"
+
+              plugins.security.allow_default_init_securityindex: true
+              plugins.security.audit.type: internal_opensearch
+
+              indices.memory.index_buffer_size: 20%
+              indices.queries.cache.size: 10%
+
+            jvm.options: |
+              -Xms{{ os_jvm_heap }}
+              -Xmx{{ os_jvm_heap }}
+              -XX:+UseG1GC
+              -XX:G1ReservePercent=25
+              -XX:InitiatingHeapOccupancyPercent=30
+              -XX:+HeapDumpOnOutOfMemoryError
+              -XX:HeapDumpPath=/usr/share/opensearch/data
+              -XX:ErrorFile=/usr/share/opensearch/logs/hs_err_pid%p.log
+
+    - name: "4-b. OpenSearch ConfigMap 적용"
+      ansible.builtin.command: kubectl apply -f /tmp/opensearch-configmap.yaml
+      register: configmap_out
+      changed_when: "'created' in configmap_out.stdout or 'configured' in configmap_out.stdout"
+
+    - name: "4-c. ConfigMap 생성 결과"
+      ansible.builtin.debug:
+        msg: "{{ configmap_out.stdout_lines }}"
+
+    - name: "4-d. 임시 ConfigMap 파일 정리"
+      ansible.builtin.file:
+        path: /tmp/opensearch-configmap.yaml
+        state: absent
+
+    # -----------------------------------------------------------------
+    # STEP 5. 매니페스트 생성 및 적용
+    # -----------------------------------------------------------------
+    - name: "5. OpenSearch 매니페스트 생성"
+      ansible.builtin.copy:
+        dest: /tmp/opensearch-manifest.yaml
+        mode: "0644"
+        content: |
+          # ============================================================
+          # 1. Headless Service
+          # ============================================================
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: {{ os_name }}-headless
+            namespace: {{ os_namespace }}
+            labels:
+              app: {{ os_name }}
+          spec:
+            clusterIP: None
+            publishNotReadyAddresses: true
+            ports:
+              - name: transport
+                port: 9300
+              - name: http
+                port: 9200
+            selector:
+              app: {{ os_name }}
+          ---
+          # ============================================================
+          # 2. ClusterIP Service
+          # ============================================================
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: {{ os_name }}
+            namespace: {{ os_namespace }}
+            labels:
+              app: {{ os_name }}
+          spec:
+            type: ClusterIP
+            ports:
+              - name: http
+                port: 9200
+                targetPort: 9200
+              - name: transport
+                port: 9300
+                targetPort: 9300
+            selector:
+              app: {{ os_name }}
+          ---
+          # ============================================================
+          # 3. StatefulSet (Master+Data 겸용 x3)
+          # ============================================================
+          apiVersion: apps/v1
+          kind: StatefulSet
+          metadata:
+            name: {{ os_name }}
+            namespace: {{ os_namespace }}
+          spec:
+            serviceName: {{ os_name }}-headless
+            replicas: {{ os_replicas }}
+            podManagementPolicy: Parallel
+            selector:
+              matchLabels:
+                app: {{ os_name }}
+            template:
+              metadata:
+                labels:
+                  app: {{ os_name }}
+              spec:
+                nodeSelector:
+                  {{ db_node_label_key }}: "{{ db_node_label_value }}"
+                tolerations:
+                  - key: "{{ db_node_taint_key }}"
+                    operator: "Equal"
+                    value: "{{ db_node_taint_value }}"
+                    effect: "NoSchedule"
+                affinity:
+                  podAntiAffinity:
+                    requiredDuringSchedulingIgnoredDuringExecution:
+                      - labelSelector:
+                          matchExpressions:
+                            - key: app
+                              operator: In
+                              values: ["{{ os_name }}"]
+                        topologyKey: "kubernetes.io/hostname"
+                initContainers:
+                  - name: setup
+                    image: {{ os_image }}
+                    securityContext:
+                      runAsUser: 0
+                    command:
+                      - sh
+                      - -c
+                      - |
+                        # 1. data 디렉토리 권한
+                        chown -R 1000:1000 /usr/share/opensearch/data
+                        # 2. 기존 OpenSearch 기본 config 파일 전체 보존
+                        cp -a /usr/share/opensearch/config/. /config/ 2>/dev/null || true
+                        # 3. 우리 설정으로 덮어쓰기 (ConfigMap)
+                        cp /configmap/opensearch.yml /config/opensearch.yml
+                        cp /configmap/jvm.options /config/jvm.options
+                        # 4. TLS 파일 복사 (Secret → config)
+                        cp /secret-transport/tls.crt /config/transport-tls.crt
+                        cp /secret-transport/tls.key /config/transport-tls.key
+                        cp /secret-transport/ca.crt  /config/transport-ca.crt
+                        cp /secret-http/tls.crt /config/http-tls.crt
+                        cp /secret-http/tls.key /config/http-tls.key
+                        cp /secret-http/ca.crt  /config/http-ca.crt
+                        # 5. 권한 설정
+                        chown -R 1000:1000 /config
+                        chmod 640 /config/*.crt /config/*.key
+                        echo "=== config 파일 목록 ==="
+                        ls -la /config/
+                    volumeMounts:
+                      - name: data
+                        mountPath: /usr/share/opensearch/data
+                      - name: configmap
+                        mountPath: /configmap
+                        readOnly: true
+                      - name: config
+                        mountPath: /config
+                      - name: transport-tls
+                        mountPath: /secret-transport
+                        readOnly: true
+                      - name: http-tls
+                        mountPath: /secret-http
+                        readOnly: true
+
+                  - name: sysctl
+                    image: harbor.miso.local/miso/busybox:1.36
+                    securityContext:
+                      privileged: true
+                    command: ["sh", "-c", "sysctl -w vm.max_map_count=262144"]
+                containers:
+                  - name: opensearch
+                    image: {{ os_image }}
+                    securityContext:
+                      runAsUser: 1000
+                      runAsGroup: 1000
+                    env:
+                      - name: OPENSEARCH_JAVA_OPTS
+                        value: "-Xms{{ os_jvm_heap }} -Xmx{{ os_jvm_heap }}"
+                      - name: DISABLE_INSTALL_DEMO_CONFIG
+                        value: "true"
+                      - name: OPENSEARCH_INITIAL_ADMIN_PASSWORD
+                        valueFrom:
+                          secretKeyRef:
+                            name: {{ os_name }}-auth
+                            key: admin-password
+                      - name: node.name
+                        valueFrom:
+                          fieldRef:
+                            fieldPath: metadata.name
+                    ports:
+                      - containerPort: 9200
+                        name: http
+                      - containerPort: 9300
+                        name: transport
+                    resources:
+                      requests:
+                        memory: {{ os_memory_request }}
+                        cpu: "500m"
+                      limits:
+                        memory: {{ os_memory_limit }}
+                        cpu: "2000m"
+                    volumeMounts:
+                      - name: data
+                        mountPath: /usr/share/opensearch/data
+                      - name: config
+                        mountPath: /usr/share/opensearch/config
+                    readinessProbe:
+                      tcpSocket:
+                        port: 9200
+                      initialDelaySeconds: 60
+                      periodSeconds: 10
+                      failureThreshold: 20
+                      timeoutSeconds: 5
+                    livenessProbe:
+                      tcpSocket:
+                        port: 9200
+                      initialDelaySeconds: 120
+                      periodSeconds: 30
+                      failureThreshold: 5
+                volumes:
+                  - name: configmap
+                    configMap:
+                      name: {{ os_name }}-config
+                  - name: config
+                    emptyDir: {}
+                  - name: transport-tls
+                    secret:
+                      secretName: {{ os_name }}-transport-tls
+                  - name: http-tls
+                    secret:
+                      secretName: {{ os_name }}-http-tls
+            volumeClaimTemplates:
+              - metadata:
+                  name: data
+                  labels:
+                    app: {{ os_name }}
+                spec:
+                  accessModes: ["ReadWriteOnce"]
+                  storageClassName: {{ os_storageclass }}
+                  resources:
+                    requests:
+                      storage: {{ os_storage_size }}
+          ---
+          # ============================================================
+          # 4. Dashboards Deployment
+          # ============================================================
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: {{ os_name }}-dashboards
+            namespace: {{ os_namespace }}
+            labels:
+              app: {{ os_name }}-dashboards
+          spec:
+            replicas: 1
+            selector:
+              matchLabels:
+                app: {{ os_name }}-dashboards
+            template:
+              metadata:
+                labels:
+                  app: {{ os_name }}-dashboards
+              spec:
+                nodeSelector:
+                  {{ db_node_label_key }}: "{{ db_node_label_value }}"
+                tolerations:
+                  - key: "{{ db_node_taint_key }}"
+                    operator: "Equal"
+                    value: "{{ db_node_taint_value }}"
+                    effect: "NoSchedule"
+                containers:
+                  - name: dashboards
+                    image: {{ os_dashboard_image }}
+                    env:
+                      - name: OPENSEARCH_HOSTS
+                        value: '["https://{{ os_name }}:9200"]'
+                      - name: OPENSEARCH_USERNAME
+                        value: "admin"
+                      - name: OPENSEARCH_PASSWORD
+                        valueFrom:
+                          secretKeyRef:
+                            name: {{ os_name }}-auth
+                            key: admin-password
+                      - name: OPENSEARCH_SSL_VERIFICATIONMODE
+                        value: "none"
+                    ports:
+                      - containerPort: 5601
+                    resources:
+                      requests:
+                        memory: "512Mi"
+                        cpu: "200m"
+                      limits:
+                        memory: "1Gi"
+                        cpu: "500m"
+                    readinessProbe:
+                      tcpSocket:
+                        port: 5601
+                      initialDelaySeconds: 60
+                      periodSeconds: 10
+                      failureThreshold: 20
+          ---
+          # ============================================================
+          # 5. Dashboards Service
+          # ============================================================
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: {{ os_name }}-dashboards
+            namespace: {{ os_namespace }}
+            labels:
+              app: {{ os_name }}-dashboards
+          spec:
+            type: ClusterIP
+            ports:
+              - name: dashboards
+                port: 5601
+                targetPort: 5601
+            selector:
+              app: {{ os_name }}-dashboards
+
+    - name: "5. OpenSearch 매니페스트 적용"
+      ansible.builtin.command: kubectl apply -f /tmp/opensearch-manifest.yaml
+      register: apply_out
+      changed_when: "'created' in apply_out.stdout or 'configured' in apply_out.stdout"
+
+    - name: "5. 적용 결과"
+      ansible.builtin.debug:
+        msg: "{{ apply_out.stdout_lines }}"
+
+    # -----------------------------------------------------------------
+    # STEP 6. 설정 변경 감지 + Rolling Restart
+    # -----------------------------------------------------------------
+    - name: "6. ConfigMap 변경 시 Rolling Restart"
+      ansible.builtin.shell: |
+        if echo "{{ apply_out.stdout }}" | grep -q "configured"; then
+          echo "변경 감지 → Rolling Restart"
+          kubectl rollout restart statefulset/{{ os_name }} -n {{ os_namespace }}
+          kubectl rollout restart deployment/{{ os_name }}-dashboards -n {{ os_namespace }}
+        else
+          echo "변경 없음 - Rolling Restart 스킵"
+        fi
+      register: restart_out
+      changed_when: "'Rolling Restart' in restart_out.stdout"
+
+    - name: "6. Rolling Restart 결과"
+      ansible.builtin.debug:
+        msg: "{{ restart_out.stdout_lines }}"
+
+    # -----------------------------------------------------------------
+    # STEP 7. Pod Ready 대기
+    # -----------------------------------------------------------------
+    - name: "7. OpenSearch Pod Ready 대기 (최대 10분)"
+      ansible.builtin.shell: |
+        kubectl wait pod \
+          -l "app={{ os_name }}" \
+          -n {{ os_namespace }} \
+          --for=condition=Ready \
+          --timeout=600s
+      register: os_wait
+      changed_when: false
+
+    - name: "7. Dashboards Pod Ready 대기"
+      ansible.builtin.shell: |
+        kubectl wait pod \
+          -l "app={{ os_name }}-dashboards" \
+          -n {{ os_namespace }} \
+          --for=condition=Ready \
+          --timeout=300s
+      register: dash_wait
+      changed_when: false
+      failed_when: false
+
+    # -----------------------------------------------------------------
+    # STEP 8. CoreDNS rewrite 추가
+    # -----------------------------------------------------------------
+    - name: "8. CoreDNS opensearch.miso.local 등록 여부 확인"
+      ansible.builtin.shell: |
+        kubectl get configmap coredns -n kube-system \
+          -o jsonpath='{.data.Corefile}' | grep -q 'opensearch\.miso\.local'
+      register: os_dns_exists
+      changed_when: false
+      failed_when: false
+
+    - name: "8. CoreDNS opensearch + dashboard rewrite 추가"
+      ansible.builtin.shell: |
+        python3 - <<'PY'
+        import subprocess, json, sys
+
+        raw = subprocess.check_output([
+            "kubectl","get","configmap","coredns","-n","kube-system","-o","json"
+        ]).decode()
+        cm = json.loads(raw)
+        corefile = cm["data"]["Corefile"]
+
+        new_rules = (
+            "      rewrite name exact opensearch.miso.local "
+            "miso-opensearch.default.svc.cluster.local\n"
+            "      rewrite name exact dashboard.miso.local "
+            "miso-opensearch-dashboards.default.svc.cluster.local\n"
+        )
+
+        lines = corefile.splitlines(True)
+        insert_at = None
+        for i, l in enumerate(lines):
+            if "rewrite name exact" in l and "miso.local" in l:
+                insert_at = i + 1
+
+        if insert_at is None:
+            print("ERROR: rewrite 블록을 찾을 수 없음")
+            sys.exit(1)
+
+        lines.insert(insert_at, new_rules)
+        cm["data"]["Corefile"] = "".join(lines)
+
+        for field in ["resourceVersion","uid","creationTimestamp","generation","managedFields"]:
+            cm.get("metadata", {}).pop(field, None)
+
+        p = subprocess.run(
+            ["kubectl","apply","-f","-"],
+            input=json.dumps(cm).encode(),
+            capture_output=True
+        )
+        sys.stdout.write(p.stdout.decode())
+        if p.returncode != 0:
+            sys.stderr.write(p.stderr.decode())
+            sys.exit(p.returncode)
+        PY
+      when: os_dns_exists.rc != 0
+      register: dns_patch
+      changed_when: true
+
+    - name: "8. CoreDNS 재시작"
+      ansible.builtin.shell: |
+        kubectl rollout restart deployment/coredns -n kube-system
+        kubectl rollout status deployment/coredns -n kube-system --timeout=60s
+      when: os_dns_exists.rc != 0
+      changed_when: true
+
+    - name: "8. DNS 결과"
+      ansible.builtin.debug:
+        msg: "{{ 'opensearch.miso.local 이미 등록됨 - 스킵' if os_dns_exists.rc == 0 else 'opensearch.miso.local + dashboard.miso.local 등록 완료' }}"
+
+    # -----------------------------------------------------------------
+    # STEP 9. 클러스터 상태 검증
+    # -----------------------------------------------------------------
+    - name: "9. OpenSearch 클러스터 상태 확인"
+      ansible.builtin.shell: |
+        kubectl exec -n {{ os_namespace }} {{ os_name }}-0 -- \
+          curl -sk https://localhost:9200/_cluster/health?pretty \
+          -u admin:{{ os_admin_password }} 2>/dev/null || echo "검증 실패"
+      register: cluster_health
+      changed_when: false
+      failed_when: false
+
+    - name: "9. 클러스터 상태 출력"
+      ansible.builtin.debug:
+        msg: "{{ cluster_health.stdout_lines | default(['출력 없음']) }}"
+
+    # -----------------------------------------------------------------
+    # STEP 10. 최종 상태 확인
+    # -----------------------------------------------------------------
+    - name: "10. 최종 상태 확인"
+      ansible.builtin.shell: |
+        echo "=== Pods ==="
+        kubectl get pods -n {{ os_namespace }} -l app={{ os_name }} -o wide
+        kubectl get pods -n {{ os_namespace }} -l app={{ os_name }}-dashboards -o wide
+        echo
+        echo "=== Services ==="
+        kubectl get svc -n {{ os_namespace }} | grep {{ os_name }}
+        echo
+        echo "=== PVC ==="
+        kubectl get pvc -n {{ os_namespace }} -l app={{ os_name }}
+        echo
+        echo "=== Certificates ==="
+        kubectl get certificate -n {{ os_namespace }} | grep {{ os_name }}
+        echo
+        echo "=== CoreDNS rewrite ==="
+        kubectl get configmap coredns -n kube-system \
+          -o jsonpath='{.data.Corefile}' | grep "miso.local"
+      register: final_status
+      changed_when: false
+
+    - name: "10. 최종 상태 출력"
+      ansible.builtin.debug:
+        msg: "{{ final_status.stdout_lines }}"
+
+    - name: "11. 임시 파일 정리"
+      ansible.builtin.file:
+        path: /tmp/opensearch-manifest.yaml
+        state: absent
+
+    # -----------------------------------------------------------------
+    # 완료 안내
+    # -----------------------------------------------------------------
+    - name: "[ 완료 안내 ]"
+      ansible.builtin.debug:
+        msg:
+          - "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          - " OpenSearch 2.x 클러스터 설치 완료 (SSL 적용)"
+          - "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          - ""
+          - " [구성]"
+          - "  Master+Data 겸용 x{{ os_replicas }} / JVM: {{ os_jvm_heap }}"
+          - "  Storage: {{ os_storage_size }} / SSL: cert-manager (internal-ca-issuer)"
+          - ""
+          - " [내부 접속 (앱에서)]"
+          - "  HTTPS : https://opensearch.miso.local:9200  (CoreDNS rewrite)"
+          - "  또는  : https://{{ os_name }}:9200"
+          - "  ※ 내부 CA 인증서이므로 verify=False 또는 CA 번들 설정 필요"
+          - ""
+          - " [Dashboards]"
+          - "  내부  : http://dashboard.miso.local:5601"
+          - "  터널  : ssh -L 5601:localhost:5601 -i <key.pem> ubuntu@<bastion-IP> -N"
+          - "  브라우저: http://localhost:5601"
+          - ""
+          - " [자격증명]"
+          - "  ID      : admin"
+          - "  Password: kubectl get secret {{ os_name }}-auth"
+          - "            -o jsonpath='{.data.admin-password}' | base64 -d"
+          - ""
+          - " [인증서 확인]"
+          - "  kubectl get certificate -n {{ os_namespace }}"
+          - "  kubectl get secret {{ os_name }}-transport-tls -n {{ os_namespace }}"
+          - "  kubectl get secret {{ os_name }}-http-tls -n {{ os_namespace }}"
+          - ""
+          - " [클러스터 상태 확인]"
+          - "  kubectl exec -n {{ os_namespace }} {{ os_name }}-0 --"
+          - "    curl -sk https://localhost:9200/_cluster/health?pretty"
+          - "    -u admin:<password>"
+          - ""
+          - " [운영 전환 JVM 변경]"
+          - "  ansible-playbook -i hosts.ini 15_opensearch_setup.yml -e os_jvm_heap=16g"
+          - "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"

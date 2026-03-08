@@ -1,0 +1,311 @@
+---
+# =================================================================
+# 18_argocd_setup.yml - ArgoCD + Image Updater 설치
+#
+# 실행: ansible-playbook -i hosts.ini 18_argocd_setup.yml
+#
+# 사전 준비 (베스천에서 1회 실행):
+#   manifest 파일은 A2_image_collect.sh 실행 시 자동 수집됨
+#   → argocd-install.yaml, argocd-image-updater.yaml 생성
+#
+# 옵션:
+#   재설치: ansible-playbook ... -e argocd_action=reinstall
+#   제거  : ansible-playbook ... -e argocd_action=remove
+# =================================================================
+
+- name: "ArgoCD + Image Updater 설치"
+  hosts: bastion
+  become: no
+  gather_facts: false
+  environment:
+    KUBECONFIG: "{{ lookup('env', 'HOME') }}/.kube/config"
+  vars:
+    argocd_action: "install"
+    argocd_namespace: "argocd"
+    argocd_hostname: "argocd.miso.local"
+
+    harbor_hostname: "harbor.miso.local"
+    harbor_project: "miso"
+    harbor_admin_user: "admin"
+    harbor_admin_password: "Harbor12345"
+
+    argocd_manifest: "http://10.1.5.10:8080/manifests/argocd-install.yaml"
+    image_updater_manifest: "http://10.1.5.10:8080/manifests/argocd-image-updater.yaml"
+
+  tasks:
+    # ---------------------------------------------------------------
+    # 사전 파일 존재 확인
+    # ---------------------------------------------------------------
+    - name: "0. manifest URL 접근 가능 확인"
+      ansible.builtin.uri:
+        url: "{{ item }}"
+        method: HEAD
+        status_code: 200
+      loop:
+        - "{{ argocd_manifest }}"
+        - "{{ image_updater_manifest }}"
+      register: manifest_check
+      ignore_errors: yes
+
+    - name: "0-b. 접근 실패 시 중단"
+      ansible.builtin.fail:
+        msg: |
+          manifest URL에 접근할 수 없습니다: {{ item.item }}
+          A2_image_collect.sh 완료 후 nginx:8080 서빙 상태를 확인하세요.
+          curl -I {{ item.item }}
+      loop: "{{ manifest_check.results }}"
+      when: item.status is not defined or item.status != 200
+
+    # ---------------------------------------------------------------
+    # 제거 / 재설치
+    # ---------------------------------------------------------------
+    - name: "ArgoCD 제거"
+      ansible.builtin.shell: |
+        kubectl delete namespace {{ argocd_namespace }} --ignore-not-found=true
+      when: argocd_action in ['remove', 'reinstall']
+      failed_when: false
+
+    - name: "제거 완료 후 종료"
+      ansible.builtin.meta: end_play
+      when: argocd_action == 'remove'
+
+    # ---------------------------------------------------------------
+    # STEP 1. ArgoCD 설치
+    # ---------------------------------------------------------------
+    - name: "1-a. argocd 네임스페이스 생성"
+      ansible.builtin.shell: |
+        kubectl create namespace {{ argocd_namespace }} \
+          --dry-run=client -o yaml | kubectl apply -f -
+      changed_when: false
+
+    - name: "1-b. ArgoCD manifest 적용"
+      ansible.builtin.shell: |
+        kubectl apply -n {{ argocd_namespace }} \
+          -f {{ argocd_manifest }}
+      register: argocd_install
+      changed_when: "'created' in argocd_install.stdout or 'configured' in argocd_install.stdout"
+
+    - name: "1-c. ArgoCD CRD 준비 대기"
+      ansible.builtin.shell: |
+        kubectl wait --for=condition=established \
+          crd/applications.argoproj.io \
+          crd/appprojects.argoproj.io \
+          --timeout=120s
+      changed_when: false
+
+    - name: "1-d. ArgoCD 서버 Pod Ready 대기 (최대 5분)"
+      ansible.builtin.shell: |
+        kubectl wait --namespace {{ argocd_namespace }} \
+          --for=condition=ready pod \
+          --selector=app.kubernetes.io/name=argocd-server \
+          --timeout=300s
+      changed_when: false
+
+    # ---------------------------------------------------------------
+    # STEP 2. Ingress 설정 (argocd.miso.local)
+    # ---------------------------------------------------------------
+    - name: "2. ArgoCD Ingress 생성"
+      ansible.builtin.shell: |
+        kubectl apply -f - << 'EOF'
+        apiVersion: networking.k8s.io/v1
+        kind: Ingress
+        metadata:
+          name: argocd-ingress
+          namespace: {{ argocd_namespace }}
+          annotations:
+            kubernetes.io/ingress.class: nginx
+            nginx.ingress.kubernetes.io/ssl-passthrough: "true"
+            nginx.ingress.kubernetes.io/backend-protocol: "HTTPS"
+        spec:
+          rules:
+          - host: {{ argocd_hostname }}
+            http:
+              paths:
+              - path: /
+                pathType: Prefix
+                backend:
+                  service:
+                    name: argocd-server
+                    port:
+                      number: 443
+        EOF
+      register: ingress_result
+      changed_when: "'created' in ingress_result.stdout or 'configured' in ingress_result.stdout"
+
+    # ---------------------------------------------------------------
+    # STEP 3. CoreDNS에 argocd.miso.local 등록
+    # ---------------------------------------------------------------
+    - name: "3-a. argocd.miso.local 이미 등록됐는지 확인"
+      ansible.builtin.shell: |
+        kubectl get configmap coredns -n kube-system \
+          -o jsonpath='{.data.Corefile}' | grep -c "argocd.miso.local" || true
+      register: argocd_dns_check
+      changed_when: false
+
+    - name: "3-b. CoreDNS hosts 블록에 argocd 추가"
+      ansible.builtin.shell: |
+        kubectl get configmap coredns -n kube-system -o json | \
+        python3 -c "
+        import json, sys
+        cm = json.load(sys.stdin)
+        corefile = cm['data']['Corefile']
+        entry = '      10.1.1.10 argocd.miso.local\n'
+        corefile = corefile.replace(
+          '10.1.5.10 harbor.miso.local\n',
+          '10.1.5.10 harbor.miso.local\n' + entry
+        )
+        cm['data']['Corefile'] = corefile
+        print(json.dumps(cm))
+        " | kubectl apply -f -
+      when: argocd_dns_check.stdout == "0"
+      register: dns_update
+
+    - name: "3-c. CoreDNS 롤링 재시작"
+      ansible.builtin.shell: |
+        kubectl rollout restart deployment coredns -n kube-system
+        kubectl rollout status deployment coredns -n kube-system --timeout=60s
+      when: dns_update is changed
+      changed_when: true
+
+    # ---------------------------------------------------------------
+    # STEP 4. Harbor 레지스트리 인증 Secret 등록
+    # ---------------------------------------------------------------
+    - name: "4. Harbor 레지스트리 Secret 등록"
+      ansible.builtin.shell: |
+        kubectl create secret docker-registry harbor-registry-secret \
+          --docker-server={{ harbor_hostname }} \
+          --docker-username={{ harbor_admin_user }} \
+          --docker-password={{ harbor_admin_password }} \
+          -n {{ argocd_namespace }} \
+          --dry-run=client -o yaml | kubectl apply -f -
+      changed_when: true
+
+    # ---------------------------------------------------------------
+    # STEP 5. ArgoCD Image Updater 설치
+    # ---------------------------------------------------------------
+    - name: "5-a. Image Updater manifest 적용"
+      ansible.builtin.shell: |
+        kubectl apply -n {{ argocd_namespace }} \
+          -f {{ image_updater_manifest }}
+      register: updater_install
+      changed_when: "'created' in updater_install.stdout or 'configured' in updater_install.stdout"
+
+    - name: "5-b. Image Updater Pod Ready 대기"
+      ansible.builtin.shell: |
+        kubectl wait --namespace {{ argocd_namespace }} \
+          --for=condition=ready pod \
+          --selector=app.kubernetes.io/name=argocd-image-updater \
+          --timeout=180s
+      changed_when: false
+
+    - name: "5-c. Image Updater Harbor 레지스트리 설정"
+      ansible.builtin.shell: |
+        kubectl patch configmap argocd-image-updater-config \
+          -n {{ argocd_namespace }} \
+          --type merge \
+          -p '{
+            "data": {
+              "registries.conf": "registries:\n- name: Harbor\n  api_url: https://{{ harbor_hostname }}\n  prefix: {{ harbor_hostname }}\n  insecure: false\n  credentials: secret:{{ argocd_namespace }}/harbor-registry-secret#.dockerconfigjson\n  default: true\n"
+            }
+          }'
+      changed_when: true
+
+    - name: "5-d. Image Updater 재시작 (설정 반영)"
+      ansible.builtin.shell: |
+        # v1.x: argocd-image-updater-controller / v0.x: argocd-image-updater
+        DEPLOY=$(kubectl get deployment -n {{ argocd_namespace }} \
+          --no-headers -o custom-columns=":metadata.name" \
+          | grep "argocd-image-updater" | head -1)
+        if [ -z "$DEPLOY" ]; then
+          echo "Image Updater deployment 없음 - skip"
+          exit 0
+        fi
+        echo "재시작: $DEPLOY"
+        kubectl rollout restart deployment "$DEPLOY" -n {{ argocd_namespace }}
+        kubectl rollout status deployment "$DEPLOY" -n {{ argocd_namespace }} --timeout=60s
+      changed_when: true
+
+    # ---------------------------------------------------------------
+    # STEP 6. miso AppProject 생성
+    # ---------------------------------------------------------------
+    - name: "6. miso AppProject 생성"
+      ansible.builtin.shell: |
+        kubectl apply -f - << 'EOF'
+        apiVersion: argoproj.io/v1alpha1
+        kind: AppProject
+        metadata:
+          name: miso
+          namespace: {{ argocd_namespace }}
+        spec:
+          description: "MISO 서비스 프로젝트"
+          sourceRepos:
+            - '*'
+          destinations:
+            - namespace: '*'
+              server: https://kubernetes.default.svc
+          clusterResourceWhitelist:
+            - group: '*'
+              kind: '*'
+        EOF
+      register: project_result
+      changed_when: "'created' in project_result.stdout or 'configured' in project_result.stdout"
+
+    # ---------------------------------------------------------------
+    # STEP 7. 초기 admin 비밀번호 조회
+    # ---------------------------------------------------------------
+    - name: "7. ArgoCD 초기 admin 비밀번호 조회"
+      ansible.builtin.shell: |
+        kubectl get secret argocd-initial-admin-secret \
+          -n {{ argocd_namespace }} \
+          -o jsonpath='{.data.password}' | base64 -d
+      register: argocd_password
+      changed_when: false
+      failed_when: false
+
+    - name: "완료 안내"
+      ansible.builtin.debug:
+        msg:
+          - "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          - " ArgoCD 구성 완료"
+          - "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          - " UI            : https://argocd.miso.local"
+          - " 초기 admin PW : {{ argocd_password.stdout | default('조회 실패') }}"
+          - " Harbor        : {{ harbor_hostname }}/{{ harbor_project }}"
+          - " Image Updater : 설치 완료 (Harbor push 감지)"
+          - " AppProject    : miso"
+          - ""
+          - " ※ 초기 비밀번호 수동 조회:"
+          - "   kubectl get secret argocd-initial-admin-secret \\"
+          - "     -n argocd -o jsonpath={.data.password} | base64 -d"
+          - ""
+          - "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          - " [DevOps 인계 사항]"
+          - "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          - " 1. Git repo 등록 (GitHub PAT 필요):"
+          - "      argocd repo add https://github.com/ORG/REPO \\"
+          - "        --username git --password <GITHUB_PAT>"
+          - ""
+          - " 2. 자동배포 App 등록 (Image Updater 사용):"
+          - "      argocd app create <APP_NAME> \\"
+          - "        --repo https://github.com/ORG/REPO \\"
+          - "        --path k8s/overlays/prod \\"
+          - "        --dest-server https://kubernetes.default.svc \\"
+          - "        --dest-namespace default \\"
+          - "        --project miso \\"
+          - "        --sync-policy automated \\"
+          - "        --annotation argocd-image-updater.argoproj.io/image-list=img={{ harbor_hostname }}/{{ harbor_project }}/<IMAGE> \\"
+          - "        --annotation argocd-image-updater.argoproj.io/img.update-strategy=latest"
+          - ""
+          - " 3. 수동배포 App 등록:"
+          - "      argocd app create <APP_NAME> \\"
+          - "        --repo https://github.com/ORG/REPO \\"
+          - "        --path k8s/overlays/prod \\"
+          - "        --dest-server https://kubernetes.default.svc \\"
+          - "        --dest-namespace default \\"
+          - "        --project miso \\"
+          - "        --sync-policy none"
+          - ""
+          - " 4. Harbor push → 자동배포 흐름:"
+          - "      docker push {{ harbor_hostname }}/{{ harbor_project }}/<IMAGE>:<TAG>"
+          - "      → Image Updater 감지 → ArgoCD 자동 sync → K8s 배포"
+          - "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"

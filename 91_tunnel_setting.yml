@@ -1,0 +1,222 @@
+---
+# =================================================================
+# 91_tunnel_setting.yml
+#
+# 목적: Bastion 내부 서비스 터널을 systemd 서비스로 등록/관리
+#
+# 방식: kubectl port-forward → systemd 서비스 등록
+#       서버 재시작 후에도 자동으로 터널 유지
+#
+# 실행 옵션:
+#   기본 (설치 + 시작):
+#     ansible-playbook -i hosts.ini 91_tunnel_setting.yml
+#
+#   전체 중지 + 제거:
+#     ansible-playbook -i hosts.ini 91_tunnel_setting.yml -e tunnel_action=stop
+#
+# 서비스 목록:
+#   tunnel-db.service          → PostgreSQL (5432)
+#   tunnel-minio.service       → MinIO Console (9001)
+#   tunnel-redis.service       → Redis (6379)       ← 설치 후 활성화
+#   tunnel-opensearch.service  → OpenSearch (9200)  ← 설치 후 활성화
+#
+# 내 PC에서 SSH 터널:
+#   PostgreSQL : ssh -L 5432:localhost:5432 -i <key.pem> ubuntu@<bastion-IP> -N
+#   MinIO      : ssh -L 9001:localhost:9001 -i <key.pem> ubuntu@<bastion-IP> -N
+# =================================================================
+
+- name: "Bastion 터널 systemd 서비스 관리"
+  hosts: bastion
+  become: yes
+  gather_facts: false
+
+  vars:
+    tunnel_action: "start"   # start(기본) or stop
+    cluster_name: "miso-db"
+    kubectl_bin: "/usr/bin/kubectl"
+    kubeconfig: "~/.kube/config"
+    tunnel_user: "ubuntu"
+
+    # 터널 서비스 정의
+    # enabled: true → 현재 활성화 (서비스 등록 + 시작)
+    # enabled: false → 미설치 서비스 (서비스 파일만 생성, 시작 안 함)
+    tunnel_services:
+      - name: "tunnel-db"
+        description: "PostgreSQL port-forward (miso-db-rw:5432)"
+        svc: "{{ cluster_name }}-rw"
+        port: "5432"
+        enabled: true
+      - name: "tunnel-minio"
+        description: "MinIO Console port-forward (minio:9001)"
+        svc: "minio"
+        port: "9001"
+        enabled: true
+      - name: "tunnel-redis"
+        description: "Redis port-forward (redis-master:6379)"
+        svc: "redis-master"
+        port: "6379"
+        enabled: false   # Redis 설치 후 true로 변경
+      - name: "tunnel-opensearch"
+        description: "OpenSearch port-forward (opensearch-svc:9200)"
+        svc: "opensearch-svc"
+        port: "9200"
+        enabled: false   # OpenSearch 설치 후 true로 변경
+
+  tasks:
+    # -----------------------------------------------------------------
+    # [ stop 모드 ] 전체 터널 중지 및 서비스 제거
+    # -----------------------------------------------------------------
+    - name: "[ STOP ] 터널 서비스 중지 및 비활성화"
+      ansible.builtin.systemd:
+        name: "{{ item.name }}.service"
+        state: stopped
+        enabled: false
+        daemon_reload: true
+      loop: "{{ tunnel_services }}"
+      when: tunnel_action == 'stop'
+      ignore_errors: true
+
+    - name: "[ STOP ] 서비스 파일 제거"
+      ansible.builtin.file:
+        path: "/etc/systemd/system/{{ item.name }}.service"
+        state: absent
+      loop: "{{ tunnel_services }}"
+      when: tunnel_action == 'stop'
+
+    - name: "[ STOP ] systemd 데몬 리로드"
+      ansible.builtin.systemd:
+        daemon_reload: true
+      when: tunnel_action == 'stop'
+
+    - name: "[ STOP ] 완료"
+      ansible.builtin.debug:
+        msg:
+          - "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          - " 전체 터널 서비스 중지 및 제거 완료"
+          - " 재시작하려면: ansible-playbook -i hosts.ini 91_tunnel_setting.yml"
+          - "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+      when: tunnel_action == 'stop'
+
+    # -----------------------------------------------------------------
+    # [ start 모드 ] 터널 서비스 등록 및 시작
+    # -----------------------------------------------------------------
+
+    # STEP 1. kubectl 경로 확인
+    - name: "1. kubectl 경로 확인"
+      ansible.builtin.shell: which kubectl
+      register: kubectl_path
+      changed_when: false
+      when: tunnel_action != 'stop'
+
+    - name: "1. kubectl 경로 설정"
+      ansible.builtin.set_fact:
+        kubectl_bin: "{{ kubectl_path.stdout | trim }}"
+      when: tunnel_action != 'stop'
+
+    # STEP 2. systemd 서비스 파일 생성
+    - name: "2. systemd 서비스 파일 생성"
+      ansible.builtin.copy:
+        dest: "/etc/systemd/system/{{ item.name }}.service"
+        mode: "0644"
+        content: |
+          [Unit]
+          Description={{ item.description }}
+          After=network.target
+
+          [Service]
+          Type=simple
+          User={{ tunnel_user }}
+          Environment=KUBECONFIG={{ kubeconfig }}
+          ExecStart={{ kubectl_bin }} port-forward svc/{{ item.svc }} {{ item.port }}:{{ item.port }} --address 127.0.0.1
+          Restart=always
+          RestartSec=10
+          StartLimitIntervalSec=0
+
+          [Install]
+          WantedBy=multi-user.target
+      loop: "{{ tunnel_services }}"
+      when: tunnel_action != 'stop'
+
+    - name: "2. systemd 데몬 리로드"
+      ansible.builtin.systemd:
+        daemon_reload: true
+      when: tunnel_action != 'stop'
+
+    # STEP 3. 활성화된 서비스만 시작
+    - name: "3. 활성화된 터널 서비스 시작 및 등록"
+      ansible.builtin.systemd:
+        name: "{{ item.name }}.service"
+        state: started
+        enabled: true
+      loop: "{{ tunnel_services }}"
+      when:
+        - tunnel_action != 'stop'
+        - item.enabled | bool
+      ignore_errors: true
+
+    - name: "3. 비활성화 서비스는 중지 상태 유지"
+      ansible.builtin.systemd:
+        name: "{{ item.name }}.service"
+        state: stopped
+        enabled: false
+      loop: "{{ tunnel_services }}"
+      when:
+        - tunnel_action != 'stop'
+        - not (item.enabled | bool)
+      ignore_errors: true
+
+    # STEP 4. 플레이북 임시 파일 정리
+    - name: "4. 플레이북 임시 파일 정리"
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - /tmp/minio-full.yaml
+        - /tmp/kubeconfig-admin.conf
+        - /tmp/custom-resources.yaml
+        - /tmp/internal-svc.yaml
+      when: tunnel_action != 'stop'
+
+    # STEP 5. 최종 상태 확인
+    - name: "5. 터널 서비스 상태 확인"
+      ansible.builtin.shell: |
+        for svc in tunnel-db tunnel-minio tunnel-redis tunnel-opensearch; do
+          STATUS=$(systemctl is-active ${svc}.service 2>/dev/null || echo "not-found")
+          ENABLED=$(systemctl is-enabled ${svc}.service 2>/dev/null || echo "not-found")
+          printf "%-25s active=%-10s enabled=%s\n" "${svc}" "${STATUS}" "${ENABLED}"
+        done
+      register: svc_status
+      changed_when: false
+      when: tunnel_action != 'stop'
+
+    - name: "5. 서비스 상태 출력"
+      ansible.builtin.debug:
+        msg: "{{ svc_status.stdout_lines }}"
+      when: tunnel_action != 'stop'
+
+    # 완료 안내
+    - name: "[ 완료 안내 ]"
+      ansible.builtin.debug:
+        msg:
+          - "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          - " 터널 서비스 등록 완료 (서버 재시작 후에도 자동 시작)"
+          - "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          - ""
+          - " [서비스 관리 명령어]"
+          - "  상태 확인 : sudo systemctl status tunnel-db"
+          - "  로그 확인 : sudo journalctl -u tunnel-db -f"
+          - "  개별 중지 : sudo systemctl stop tunnel-db"
+          - "  개별 시작 : sudo systemctl start tunnel-db"
+          - ""
+          - " [전체 중지 및 제거]"
+          - "  ansible-playbook -i hosts.ini 91_tunnel_setting.yml -e tunnel_action=stop"
+          - ""
+          - " [내 PC에서 SSH 터널]"
+          - "  PostgreSQL : ssh -L 5432:localhost:5432 -i <key.pem> ubuntu@<bastion-IP> -N"
+          - "  MinIO      : ssh -L 9001:localhost:9001 -i <key.pem> ubuntu@<bastion-IP> -N"
+          - ""
+          - " [향후 서비스 추가 시 (Redis, OpenSearch)]"
+          - "  tunnel_services 에서 enabled: true 로 변경 후 재실행"
+          - "  ansible-playbook -i hosts.ini 91_tunnel_setting.yml"
+          - "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+      when: tunnel_action != 'stop'

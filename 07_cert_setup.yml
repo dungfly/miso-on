@@ -1,0 +1,117 @@
+---
+- name: Setup Cert-manager and Internal Self-Signed CA
+  hosts: bastion
+  become: no
+  environment:
+    KUBECONFIG: "{{ lookup('env', 'HOME') }}/.kube/config"
+  vars:
+    cert_manager_version: "v1.14.4"
+    cert_manager_url: "http://10.1.5.10:8080/manifests/cert-manager.yaml"
+
+  tasks:
+    - name: 1. Cert-manager 네임스페이스 생성
+      shell: kubectl create namespace cert-manager
+      register: ns_out
+      failed_when: ns_out.rc != 0 and ("AlreadyExists" not in (ns_out.stderr | default("")))
+      changed_when: ns_out.rc == 0
+
+    - name: 2. Cert-manager 매니페스트 적용 (CRD 포함)
+      shell: kubectl apply -f {{ cert_manager_url }} --validate=false
+      register: cm_install
+      changed_when: "'created' in cm_install.stdout or 'configured' in cm_install.stdout"
+
+    - name: 3-a. Cert-manager CRD 등록 완료 대기
+      shell: |
+        kubectl wait --for=condition=established \
+          crd/clusterissuers.cert-manager.io \
+          crd/certificates.cert-manager.io \
+          crd/issuers.cert-manager.io \
+          --timeout=120s
+      register: crd_wait
+      retries: 5
+      delay: 10
+      until: crd_wait.rc == 0
+      changed_when: false
+
+    - name: 3-b. Cert-manager Pod Ready 상태 대기
+      shell: |
+        kubectl wait --namespace cert-manager \
+          --for=condition=ready pod \
+          --selector=app.kubernetes.io/instance=cert-manager \
+          --timeout=180s
+      changed_when: false
+
+    - name: 3-c. Webhook 완전 기동 대기 (Connection refused 방지)
+      wait_for:
+        timeout: 20
+      changed_when: false
+
+    - name: 4. 내부 Self-signed ClusterIssuer 생성
+      shell: kubectl apply -f -
+      args:
+        stdin: |
+          apiVersion: cert-manager.io/v1
+          kind: ClusterIssuer
+          metadata:
+            name: selfsigned-cluster-issuer
+          spec:
+            selfSigned: {}
+      register: issuer_res
+      changed_when: "'created' in issuer_res.stdout or 'configured' in issuer_res.stdout"
+
+    - name: 5. 내부 Root CA 인증서 생성
+      shell: kubectl apply -f -
+      args:
+        stdin: |
+          apiVersion: cert-manager.io/v1
+          kind: Certificate
+          metadata:
+            name: internal-root-ca
+            namespace: cert-manager
+          spec:
+            isCA: true
+            duration: 87600h
+            commonName: internal-root-ca
+            secretName: internal-root-ca-secret
+            privateKey:
+              algorithm: ECDSA
+              size: 256
+            issuerRef:
+              name: selfsigned-cluster-issuer
+              kind: ClusterIssuer
+              group: cert-manager.io
+      register: ca_res
+      changed_when: "'created' in ca_res.stdout or 'configured' in ca_res.stdout"
+
+    - name: 5-b. internal-root-ca-secret 생성 완료 대기
+      shell: |
+        kubectl get secret internal-root-ca-secret \
+          -n cert-manager --no-headers 2>/dev/null | wc -l
+      register: ca_secret_wait
+      until: ca_secret_wait.stdout | trim | int > 0
+      retries: 30
+      delay: 5
+      changed_when: false
+
+    - name: 6. Root CA 기반의 실제 Issuer 생성
+      shell: kubectl apply -f -
+      args:
+        stdin: |
+          apiVersion: cert-manager.io/v1
+          kind: ClusterIssuer
+          metadata:
+            name: internal-ca-issuer
+          spec:
+            ca:
+              secretName: internal-root-ca-secret
+      register: final_issuer
+      changed_when: "'created' in final_issuer.stdout or 'configured' in final_issuer.stdout"
+
+    - name: 7. 생성된 Issuer 확인
+      shell: kubectl get clusterissuer
+      register: issuers_status
+      changed_when: false
+
+    - name: 8. Issuer 상태 출력
+      debug:
+        msg: "{{ issuers_status.stdout_lines }}"

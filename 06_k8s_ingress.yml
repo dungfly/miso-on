@@ -1,0 +1,49 @@
+---
+- name: "Nginx Ingress Controller 설치"
+  hosts: bastion
+  become: no
+  environment:
+    KUBECONFIG: "{{ lookup('env', 'HOME') }}/.kube/config"
+  vars:
+    ingress_version: "controller-v1.10.1" # v1.30 호환 버전
+
+  tasks:
+    - name: "Ingress-Nginx 네임스페이스 존재 여부 확인"
+      ansible.builtin.shell: kubectl get ns ingress-nginx
+      register: ns_check
+      failed_when: false
+      changed_when: false
+
+    - name: "Bare-metal용 Nginx Ingress manifest 적용"
+      ansible.builtin.shell: |
+        kubectl apply -f http://10.1.5.10:8080/manifests/ingress-nginx.yaml --validate=false
+      when: ns_check.rc != 0
+
+    - name: "Ingress Controller 서비스의 NodePort를 30080, 30443으로 고정"
+      ansible.builtin.shell: |
+        kubectl patch svc ingress-nginx-controller -n ingress-nginx --type='json' -p='[
+          {"op": "replace", "path": "/spec/ports/0/nodePort", "value": 30080},
+          {"op": "replace", "path": "/spec/ports/1/nodePort", "value": 30443}
+        ]'
+      register: patch_result
+      failed_when: false
+
+    - name: "Ingress Controller Pod가 Ready 상태가 될 때까지 대기"
+      ansible.builtin.shell: |
+        kubectl wait --namespace ingress-nginx \
+          --for=condition=ready pod \
+          --selector=app.kubernetes.io/component=controller \
+          --timeout=120s
+      register: wait_result
+      changed_when: false
+
+    - name: "최종 포트 고정 확인 (NodePort)"
+      ansible.builtin.shell: |
+        kubectl get svc ingress-nginx-controller -n ingress-nginx \
+        -o jsonpath='{.spec.ports[*].nodePort}'
+      register: fixed_ports
+      changed_when: false
+
+    - name: "포트 설정 결과 출력"
+      ansible.builtin.debug:
+        msg: "현재 설정된 NodePort는 {{ fixed_ports.stdout }} 입니다. (기대값: 30080 30443)"

@@ -1,0 +1,356 @@
+---
+# =================================================================
+# 16_harbor_setup.yml - Harbor 컨테이너 레지스트리 구성 (온라인 버전)
+#
+# 실행: ansible-playbook -i hosts.ini 16_harbor_setup.yml
+#
+# 사전 준비:
+#   - harbor-offline-installer-v2.10.2.tgz 를 플레이북 위치에 준비
+#     없으면 자동 다운로드
+#
+# 포트:
+#   - 443 : Harbor HTTPS (harbor.miso.local)
+#   - 80  : HTTP → HTTPS redirect
+# =================================================================
+
+- name: "Harbor 레지스트리 구성"
+  hosts: harbor
+  become: yes
+  vars:
+    harbor_version: "v2.10.2"
+    harbor_install_dir: "/opt/harbor"
+    harbor_data_dir: "/data/harbor"
+    harbor_hostname: "harbor.miso.local"
+    harbor_admin_password: "Harbor12345"     # 변경 권장
+
+    harbor_cert_dir: "/etc/harbor/certs"
+    harbor_cert_src: "./tls.crt"
+    harbor_key_src:  "./tls.key"
+
+  tasks:
+    # ---------------------------------------------------------------
+    # STEP 1. Docker CE 설치
+    # ---------------------------------------------------------------
+    - name: "1-a. 필수 패키지 설치"
+      ansible.builtin.apt:
+        name:
+          - ca-certificates
+          - curl
+          - gnupg
+          - openssl
+        state: present
+        update_cache: yes
+
+    - name: "1-b. Docker GPG 키 등록"
+      ansible.builtin.shell: |
+        mkdir -p /etc/apt/keyrings
+        curl -fsSL https://download.docker.com/linux/ubuntu/gpg \
+          | gpg --dearmor --yes -o /etc/apt/keyrings/docker.gpg
+      args:
+        creates: /etc/apt/keyrings/docker.gpg
+
+    - name: "1-c. Docker apt 저장소 등록"
+      ansible.builtin.copy:
+        dest: /etc/apt/sources.list.d/docker.list
+        mode: "0644"
+        content: |
+          deb [arch=amd64 signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu jammy stable
+
+    - name: "1-d. Docker CE 설치"
+      ansible.builtin.apt:
+        name:
+          - docker-ce
+          - docker-ce-cli
+          - containerd.io
+          - docker-compose-plugin
+        state: present
+        update_cache: yes
+
+    - name: "1-e. Docker 서비스 활성화"
+      ansible.builtin.systemd:
+        name: docker
+        state: started
+        enabled: yes
+
+    # ---------------------------------------------------------------
+    # STEP 2. TLS 인증서 준비
+    # ---------------------------------------------------------------
+    - name: "2-a. 인증서 디렉토리 생성"
+      ansible.builtin.file:
+        path: "{{ harbor_cert_dir }}"
+        state: directory
+        mode: "0755"
+
+    - name: "2-b. 외부 인증서 파일 존재 여부 확인"
+      ansible.builtin.stat:
+        path: "{{ harbor_cert_src }}"
+      delegate_to: localhost
+      become: false
+      register: cert_file_check
+
+    - name: "2-c. 자체서명 인증서 생성 (외부 인증서 없을 때)"
+      ansible.builtin.shell: |
+        openssl req -x509 -nodes -days 3650 -newkey rsa:4096 \
+          -keyout {{ harbor_cert_dir }}/harbor.key \
+          -out    {{ harbor_cert_dir }}/harbor.crt \
+          -subj "/CN={{ harbor_hostname }}/O=miso" \
+          -addext "subjectAltName=DNS:{{ harbor_hostname }},IP:{{ ansible_host }}"
+      args:
+        creates: "{{ harbor_cert_dir }}/harbor.crt"
+      when: not cert_file_check.stat.exists
+
+    - name: "2-d. 외부 인증서 복사 (있을 때)"
+      ansible.builtin.copy:
+        src: "{{ item.src }}"
+        dest: "{{ item.dest }}"
+        mode: "0600"
+      loop:
+        - { src: "{{ harbor_cert_src }}", dest: "{{ harbor_cert_dir }}/harbor.crt" }
+        - { src: "{{ harbor_key_src }}",  dest: "{{ harbor_cert_dir }}/harbor.key" }
+      when: cert_file_check.stat.exists
+
+    - name: "2-e. 시스템 CA 신뢰 등록"
+      ansible.builtin.shell: |
+        cp {{ harbor_cert_dir }}/harbor.crt \
+           /usr/local/share/ca-certificates/harbor.crt
+        update-ca-certificates
+      changed_when: true
+
+    # ---------------------------------------------------------------
+    # STEP 3. Harbor 설치
+    # ---------------------------------------------------------------
+    - name: "3-a. Harbor installer 로컬 존재 확인"
+      ansible.builtin.stat:
+        path: "./harbor-offline-installer-{{ harbor_version }}.tgz"
+      delegate_to: localhost
+      become: false
+      register: harbor_installer_check
+
+    - name: "3-b. Harbor installer 업로드 (로컬 파일 있을 때)"
+      ansible.builtin.copy:
+        src: "./harbor-offline-installer-{{ harbor_version }}.tgz"
+        dest: "/tmp/harbor-offline-installer-{{ harbor_version }}.tgz"
+        mode: "0644"
+      when: harbor_installer_check.stat.exists
+
+    - name: "3-c. Harbor installer 다운로드 (로컬 파일 없을 때)"
+      ansible.builtin.get_url:
+        url: "https://github.com/goharbor/harbor/releases/download/{{ harbor_version }}/harbor-offline-installer-{{ harbor_version }}.tgz"
+        dest: "/tmp/harbor-offline-installer-{{ harbor_version }}.tgz"
+        mode: "0644"
+      when: not harbor_installer_check.stat.exists
+
+    - name: "3-d. 설치 디렉토리 생성"
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        mode: "0755"
+      loop:
+        - "{{ harbor_install_dir }}"
+        - "{{ harbor_data_dir }}"
+
+    - name: "3-e. Harbor 압축 해제"
+      ansible.builtin.unarchive:
+        src: "/tmp/harbor-offline-installer-{{ harbor_version }}.tgz"
+        dest: "{{ harbor_install_dir }}"
+        remote_src: yes
+        extra_opts: ["--strip-components=1"]
+        creates: "{{ harbor_install_dir }}/harbor.yml.tmpl"
+
+    - name: "3-f. harbor.yml 생성 (tmpl 기반 - 필수 항목 누락 방지)"
+      ansible.builtin.shell: |
+        set -e
+        # harbor.yml.tmpl 을 그대로 복사 (모든 필수 키 보장)
+        cp {{ harbor_install_dir }}/harbor.yml.tmpl \
+           {{ harbor_install_dir }}/harbor.yml
+
+        # hostname
+        sed -i "s|^hostname:.*|hostname: {{ harbor_hostname }}|" \
+          {{ harbor_install_dir }}/harbor.yml
+
+        # https 인증서 경로
+        sed -i "s|certificate: /your/certificate/path|certificate: {{ harbor_cert_dir }}/harbor.crt|" \
+          {{ harbor_install_dir }}/harbor.yml
+        sed -i "s|private_key: /your/private/key/path|private_key: {{ harbor_cert_dir }}/harbor.key|" \
+          {{ harbor_install_dir }}/harbor.yml
+
+        # admin 비밀번호
+        sed -i "s|harbor_admin_password:.*|harbor_admin_password: {{ harbor_admin_password }}|" \
+          {{ harbor_install_dir }}/harbor.yml
+
+        # 데이터 경로
+        sed -i "s|data_volume:.*|data_volume: {{ harbor_data_dir }}|" \
+          {{ harbor_install_dir }}/harbor.yml
+
+        echo "harbor.yml 생성 완료"
+      args:
+        creates: "{{ harbor_install_dir }}/harbor.yml"
+
+    - name: "3-g. Harbor 설치 실행"
+      ansible.builtin.shell: |
+        cd {{ harbor_install_dir }}
+        ./install.sh --with-trivy
+      args:
+        creates: "{{ harbor_install_dir }}/docker-compose.yml"
+      register: harbor_install_out
+
+    - name: "3-h. Harbor 설치 결과 출력"
+      ansible.builtin.debug:
+        msg: "{{ harbor_install_out.stdout_lines | default(['이미 설치됨 - skip']) }}"
+
+    - name: "3-i. Harbor 기동 대기 (최대 3분)"
+      ansible.builtin.uri:
+        url: "https://{{ ansible_host }}/api/v2.0/health"
+        validate_certs: no
+        status_code: 200
+      register: harbor_health
+      until: harbor_health.status == 200
+      retries: 36
+      delay: 5
+
+    # ---------------------------------------------------------------
+    # STEP 4. Harbor 프로젝트 초기 구성
+    # ---------------------------------------------------------------
+    - name: "4-a. miso 프로젝트 생성 (내부 이미지용, private)"
+      ansible.builtin.uri:
+        url: "https://{{ ansible_host }}/api/v2.0/projects"
+        method: POST
+        user: admin
+        password: "{{ harbor_admin_password }}"
+        force_basic_auth: yes
+        validate_certs: no
+        status_code: [201, 409]
+        body_format: json
+        body:
+          project_name: "miso"
+          public: false
+          metadata:
+            public: "false"
+
+    # ---------------------------------------------------------------
+    # STEP 5. Harbor CA 인증서 bastion으로 fetch
+    # ---------------------------------------------------------------
+    - name: "5. Harbor CA 인증서 bastion으로 fetch"
+      ansible.builtin.fetch:
+        src: "{{ harbor_cert_dir }}/harbor.crt"
+        dest: /tmp/harbor-ca.crt
+        flat: yes
+
+# ---------------------------------------------------------------
+# Harbor CA 인증서를 전체 K8s 노드에 배포
+# ---------------------------------------------------------------
+# CA 인증서는 lb 포함 전체 노드에 배포 (시스템 신뢰만)
+- name: "Harbor CA 인증서 전체 노드 배포 (시스템 신뢰)"
+  hosts: all:!bastion:!harbor:!monitoring
+  become: yes
+  gather_facts: false
+  tasks:
+    - name: "Harbor CA 시스템 신뢰 등록"
+      ansible.builtin.copy:
+        src: /tmp/harbor-ca.crt
+        dest: /usr/local/share/ca-certificates/harbor.crt
+        mode: "0644"
+
+    - name: "CA 인증서 적용"
+      ansible.builtin.shell: update-ca-certificates
+      changed_when: true
+
+# containerd 설정은 K8s 노드에만 (lb 제외)
+- name: "Harbor CA 인증서 containerd 등록 (K8s 노드)"
+  hosts: k8s
+  become: yes
+  gather_facts: false
+  tasks:
+    - name: "containerd certs.d 디렉토리 생성"
+      ansible.builtin.file:
+        path: /etc/containerd/certs.d/harbor.miso.local
+        state: directory
+        mode: "0755"
+
+    - name: "containerd에 Harbor 인증서 등록"
+      ansible.builtin.copy:
+        dest: /etc/containerd/certs.d/harbor.miso.local/hosts.toml
+        mode: "0644"
+        content: |
+          server = "https://harbor.miso.local"
+
+          [host."https://harbor.miso.local"]
+            ca = "/usr/local/share/ca-certificates/harbor.crt"
+      notify: Restart containerd
+
+  handlers:
+    - name: Restart containerd
+      ansible.builtin.systemd:
+        name: containerd
+        state: restarted
+
+# ---------------------------------------------------------------
+# CoreDNS에 harbor.miso.local 등록
+# ---------------------------------------------------------------
+- name: "CoreDNS harbor.miso.local 등록"
+  hosts: bastion
+  become: no
+  gather_facts: false
+  environment:
+    KUBECONFIG: "{{ lookup('env', 'HOME') }}/.kube/config"
+  tasks:
+    - name: "harbor.miso.local 이미 등록됐는지 확인"
+      ansible.builtin.shell: |
+        kubectl get configmap coredns -n kube-system \
+          -o jsonpath='{.data.Corefile}' | grep -c "harbor.miso.local" || true
+      register: harbor_dns_check
+      changed_when: false
+
+    - name: "CoreDNS hosts 블록에 harbor 추가"
+      ansible.builtin.shell: |
+        kubectl get configmap coredns -n kube-system -o json | \
+        python3 -c "
+        import json, sys
+        cm = json.load(sys.stdin)
+        corefile = cm['data']['Corefile']
+        entry = '    hosts {\n      10.1.5.10 harbor.miso.local\n      fallthrough\n    }\n'
+        corefile = corefile.replace('    ready\n', '    ready\n' + entry, 1)
+        cm['data']['Corefile'] = corefile
+        print(json.dumps(cm))
+        " | kubectl apply -f -
+      when: harbor_dns_check.stdout == "0"
+      register: dns_update
+
+    - name: "CoreDNS 롤링 재시작"
+      ansible.builtin.shell: |
+        kubectl rollout restart deployment coredns -n kube-system
+        kubectl rollout status deployment coredns -n kube-system --timeout=60s
+      when: dns_update is changed
+      changed_when: true
+
+    - name: "harbor.miso.local DNS 확인"
+      ansible.builtin.shell: |
+        nslookup harbor.miso.local 2>/dev/null || true
+      register: dns_check
+      changed_when: false
+      failed_when: false
+
+    - name: "DNS 결과 출력"
+      ansible.builtin.debug:
+        msg: "{{ dns_check.stdout_lines }}"
+
+# ---------------------------------------------------------------
+# 완료 요약
+# ---------------------------------------------------------------
+- name: "Harbor 구성 완료 요약"
+  hosts: bastion
+  become: no
+  gather_facts: false
+  tasks:
+    - name: "완료 안내"
+      ansible.builtin.debug:
+        msg:
+          - "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          - " Harbor 구성 완료"
+          - "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          - " UI      : https://harbor.miso.local"
+          - " Admin   : admin / Harbor12345  ← 변경 권장"
+          - " 프로젝트: miso (private)"
+          - ""
+          - " docker login harbor.miso.local"
+          - "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"

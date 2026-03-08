@@ -1,0 +1,433 @@
+---
+# =================================================================
+# 17.5_node_exporter.yml
+# node-exporter DaemonSet + Promtail 전체 노드 배포
+#
+# 실행: ansible-playbook -i hosts.ini 17.5_node_exporter.yml
+#
+# [node-exporter]
+#   K8s DaemonSet → 전체 노드 메트릭 수집 (포트 9100)
+#   Harbor/Monitor VM → docker 컨테이너
+#
+# [Promtail]
+#   K8s DaemonSet → 전체 노드 로그 수집 → Loki(10.1.5.100:3100) 전송
+#   Harbor/Monitor VM → docker 컨테이너
+#
+# 수집 대상:
+#   /var/log/*.log, /var/log/syslog
+#   K8s 컨테이너 로그: /var/log/pods/**/*.log
+# =================================================================
+
+# =================================================================
+# PLAY 1. K8s 노드: node-exporter + Promtail DaemonSet
+# =================================================================
+- name: "node-exporter + Promtail DaemonSet 배포"
+  hosts: bastion
+  become: no
+  gather_facts: false
+  environment:
+    KUBECONFIG: "{{ lookup('env', 'HOME') }}/.kube/config"
+  vars:
+    loki_url: "http://10.1.5.100:3100/loki/api/v1/push"
+    harbor: "harbor.miso.local/miso"
+
+  tasks:
+    - name: "1. monitoring 네임스페이스 생성"
+      ansible.builtin.shell: |
+        kubectl create namespace monitoring --dry-run=client -o yaml | kubectl apply -f -
+      changed_when: false
+
+    # ---------------------------------------------------------------
+    # node-exporter DaemonSet
+    # ---------------------------------------------------------------
+    - name: "2. node-exporter DaemonSet + Service 배포"
+      ansible.builtin.shell: |
+        kubectl apply -f - << 'YAMEOF'
+        apiVersion: apps/v1
+        kind: DaemonSet
+        metadata:
+          name: node-exporter
+          namespace: monitoring
+          labels:
+            app: node-exporter
+        spec:
+          selector:
+            matchLabels:
+              app: node-exporter
+          template:
+            metadata:
+              labels:
+                app: node-exporter
+            spec:
+              hostNetwork: true
+              hostPID: true
+              tolerations:
+                - operator: Exists
+              containers:
+                - name: node-exporter
+                  image: {{ harbor }}/node-exporter:v1.7.0
+                  args:
+                    - '--path.sysfs=/host/sys'
+                    - '--path.procfs=/host/proc'
+                    - '--path.rootfs=/host/root'
+                    - '--collector.filesystem.mount-points-exclude=^/(sys|proc|dev|host|etc)($$|/)'
+                  ports:
+                    - containerPort: 9100
+                      hostPort: 9100
+                      name: metrics
+                  resources:
+                    requests:
+                      cpu: 50m
+                      memory: 50Mi
+                    limits:
+                      cpu: 200m
+                      memory: 100Mi
+                  volumeMounts:
+                    - name: proc
+                      mountPath: /host/proc
+                      readOnly: true
+                    - name: sys
+                      mountPath: /host/sys
+                      readOnly: true
+                    - name: root
+                      mountPath: /host/root
+                      mountPropagation: HostToContainer
+                      readOnly: true
+              volumes:
+                - name: proc
+                  hostPath:
+                    path: /proc
+                - name: sys
+                  hostPath:
+                    path: /sys
+                - name: root
+                  hostPath:
+                    path: /
+        ---
+        apiVersion: v1
+        kind: Service
+        metadata:
+          name: node-exporter
+          namespace: monitoring
+          labels:
+            app: node-exporter
+          annotations:
+            prometheus.io/scrape: "true"
+            prometheus.io/port: "9100"
+        spec:
+          type: ClusterIP
+          clusterIP: None
+          ports:
+            - port: 9100
+              targetPort: 9100
+              name: metrics
+          selector:
+            app: node-exporter
+        YAMEOF
+      register: ne_result
+      changed_when: "'created' in ne_result.stdout or 'configured' in ne_result.stdout"
+
+    # ---------------------------------------------------------------
+    # Promtail DaemonSet
+    # ---------------------------------------------------------------
+    - name: "3. Promtail ConfigMap 배포"
+      ansible.builtin.shell: |
+        kubectl apply -f - << 'YAMEOF'
+        apiVersion: v1
+        kind: ConfigMap
+        metadata:
+          name: promtail-config
+          namespace: monitoring
+        data:
+          promtail.yml: |
+            server:
+              http_listen_port: 9080
+              grpc_listen_port: 0
+
+            positions:
+              filename: /tmp/positions.yaml
+
+            clients:
+              - url: {{ loki_url }}
+
+            scrape_configs:
+              # 시스템 로그 (/var/log)
+              - job_name: system
+                static_configs:
+                  - targets:
+                      - localhost
+                    labels:
+                      job: syslog
+                      __path__: /var/log/{syslog,*.log}
+                pipeline_stages:
+                  - drop:
+                      expression: "^$"
+
+              # K8s 컨테이너 로그 (/var/log/pods)
+              - job_name: kubernetes-pods
+                kubernetes_sd_configs:
+                  - role: pod
+                relabel_configs:
+                  - source_labels: [__meta_kubernetes_pod_node_name]
+                    target_label: node
+                  - source_labels: [__meta_kubernetes_namespace]
+                    target_label: namespace
+                  - source_labels: [__meta_kubernetes_pod_name]
+                    target_label: pod
+                  - source_labels: [__meta_kubernetes_pod_container_name]
+                    target_label: container
+                  - source_labels: [__meta_kubernetes_pod_label_app]
+                    target_label: app
+                  - replacement: /var/log/pods/*$1/*.log
+                    separator: /
+                    source_labels:
+                      - __meta_kubernetes_pod_uid
+                      - __meta_kubernetes_pod_container_name
+                    target_label: __path__
+        YAMEOF
+      register: cm_result
+      changed_when: "'created' in cm_result.stdout or 'configured' in cm_result.stdout"
+
+    - name: "4. Promtail ServiceAccount + ClusterRole 배포"
+      ansible.builtin.shell: |
+        kubectl apply -f - << 'YAMEOF'
+        apiVersion: v1
+        kind: ServiceAccount
+        metadata:
+          name: promtail
+          namespace: monitoring
+        ---
+        apiVersion: rbac.authorization.k8s.io/v1
+        kind: ClusterRole
+        metadata:
+          name: promtail
+        rules:
+          - apiGroups: [""]
+            resources: [nodes, nodes/proxy, services, endpoints, pods]
+            verbs: [get, watch, list]
+        ---
+        apiVersion: rbac.authorization.k8s.io/v1
+        kind: ClusterRoleBinding
+        metadata:
+          name: promtail
+        subjects:
+          - kind: ServiceAccount
+            name: promtail
+            namespace: monitoring
+        roleRef:
+          kind: ClusterRole
+          name: promtail
+          apiGroup: rbac.authorization.k8s.io
+        YAMEOF
+      register: rbac_result
+      changed_when: "'created' in rbac_result.stdout or 'configured' in rbac_result.stdout"
+
+    - name: "5. Promtail DaemonSet 배포"
+      ansible.builtin.shell: |
+        kubectl apply -f - << 'YAMEOF'
+        apiVersion: apps/v1
+        kind: DaemonSet
+        metadata:
+          name: promtail
+          namespace: monitoring
+          labels:
+            app: promtail
+        spec:
+          selector:
+            matchLabels:
+              app: promtail
+          template:
+            metadata:
+              labels:
+                app: promtail
+            spec:
+              serviceAccountName: promtail
+              tolerations:
+                - operator: Exists    # db taint 포함 전체 노드 배포
+              containers:
+                - name: promtail
+                  image: {{ harbor }}/promtail:2.9.8
+                  args:
+                    - -config.file=/etc/promtail/promtail.yml
+                  ports:
+                    - containerPort: 9080
+                      name: http-metrics
+                  resources:
+                    requests:
+                      cpu: 50m
+                      memory: 64Mi
+                    limits:
+                      cpu: 200m
+                      memory: 128Mi
+                  env:
+                    - name: HOSTNAME
+                      valueFrom:
+                        fieldRef:
+                          fieldPath: spec.nodeName
+                  volumeMounts:
+                    - name: config
+                      mountPath: /etc/promtail
+                    - name: varlog
+                      mountPath: /var/log
+                      readOnly: true
+                    - name: varlibdockercontainers
+                      mountPath: /var/lib/docker/containers
+                      readOnly: true
+                    - name: pods
+                      mountPath: /var/log/pods
+                      readOnly: true
+              volumes:
+                - name: config
+                  configMap:
+                    name: promtail-config
+                - name: varlog
+                  hostPath:
+                    path: /var/log
+                - name: varlibdockercontainers
+                  hostPath:
+                    path: /var/lib/docker/containers
+                - name: pods
+                  hostPath:
+                    path: /var/log/pods
+        YAMEOF
+      register: promtail_result
+      changed_when: "'created' in promtail_result.stdout or 'configured' in promtail_result.stdout"
+
+    - name: "6. DaemonSet 롤아웃 대기"
+      ansible.builtin.shell: |
+        kubectl rollout status daemonset/node-exporter -n monitoring --timeout=120s
+        kubectl rollout status daemonset/promtail -n monitoring --timeout=120s
+      changed_when: false
+
+    - name: "7. Pod 상태 확인"
+      ansible.builtin.shell: |
+        echo "=== node-exporter ==="
+        kubectl get pods -n monitoring -l app=node-exporter -o wide
+        echo ""
+        echo "=== promtail ==="
+        kubectl get pods -n monitoring -l app=promtail -o wide
+      register: pods_out
+      changed_when: false
+
+    - name: "8. 결과 출력"
+      ansible.builtin.debug:
+        msg: "{{ pods_out.stdout_lines }}"
+
+# =================================================================
+# PLAY 2. Harbor/Monitor VM: node-exporter + Promtail docker
+# =================================================================
+- name: "Harbor/Monitor VM - node-exporter + Promtail docker 설치"
+  hosts: harbor:monitoring
+  become: yes
+  gather_facts: true
+  vars:
+    harbor: "harbor.miso.local/miso"
+    loki_url: "http://10.1.5.100:3100/loki/api/v1/push"
+
+  tasks:
+    - name: "1. 설정 디렉토리 생성"
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        mode: "0755"
+      loop:
+        - /opt/exporters
+        - /opt/exporters/promtail
+
+    - name: "2. Promtail 설정 파일 배포"
+      ansible.builtin.copy:
+        dest: /opt/exporters/promtail/promtail.yml
+        mode: "0644"
+        content: |
+          server:
+            http_listen_port: 9080
+            grpc_listen_port: 0
+
+          positions:
+            filename: /tmp/positions.yaml
+
+          clients:
+            - url: {{ loki_url }}
+
+          scrape_configs:
+            - job_name: system
+              static_configs:
+                - targets:
+                    - localhost
+                  labels:
+                    job: syslog
+                    host: {{ inventory_hostname }}
+                    __path__: /var/log/{syslog,*.log}
+              pipeline_stages:
+                - drop:
+                    expression: "^$"
+
+    - name: "3. node-exporter 컨테이너 실행"
+      community.docker.docker_container:
+        name: node-exporter
+        image: "{{ harbor }}/node-exporter:v1.7.0"
+        state: started
+        restart_policy: unless-stopped
+        network_mode: host
+        pid_mode: host
+        volumes:
+          - /proc:/host/proc:ro
+          - /sys:/host/sys:ro
+          - /:/host/root:ro
+        command:
+          - '--path.procfs=/host/proc'
+          - '--path.sysfs=/host/sys'
+          - '--path.rootfs=/host/root'
+          - '--collector.filesystem.mount-points-exclude=^/(sys|proc|dev|host|etc)($|/)'
+
+    - name: "4. Promtail 컨테이너 실행"
+      community.docker.docker_container:
+        name: promtail
+        image: "{{ harbor }}/promtail:2.9.8"
+        state: started
+        restart_policy: unless-stopped
+        volumes:
+          - /opt/exporters/promtail:/etc/promtail
+          - /var/log:/var/log:ro
+        command:
+          - '-config.file=/etc/promtail/promtail.yml'
+
+    - name: "5. 컨테이너 상태 확인"
+      ansible.builtin.shell: |
+        docker ps --filter name=node-exporter --filter name=promtail \
+          --format "table {{ '{{' }}.Names{{ '}}' }}\t{{ '{{' }}.Status{{ '}}' }}\t{{ '{{' }}.Image{{ '}}' }}"
+      register: container_status
+      changed_when: false
+
+    - name: "6. 상태 출력"
+      ansible.builtin.debug:
+        msg: "{{ container_status.stdout_lines }}"
+
+# =================================================================
+# 완료 안내
+# =================================================================
+- name: "배포 완료 요약"
+  hosts: bastion
+  become: no
+  gather_facts: false
+  tasks:
+    - name: "완료 안내"
+      ansible.builtin.debug:
+        msg:
+          - "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          - " node-exporter + Promtail 배포 완료"
+          - "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          - " [node-exporter]"
+          - "   K8s 전체 노드  : DaemonSet (namespace: monitoring, port 9100)"
+          - "   Harbor/Monitor : docker 컨테이너 (port 9100)"
+          - ""
+          - " [Promtail]"
+          - "   K8s 전체 노드  : DaemonSet (namespace: monitoring)"
+          - "     수집: /var/log, /var/log/pods (K8s 컨테이너 로그)"
+          - "   Harbor/Monitor : docker 컨테이너"
+          - "     수집: /var/log"
+          - "   → Loki(10.1.5.100:3100) 로 전송"
+          - ""
+          - " Grafana에서 확인:"
+          - "   https://monitor.miso.local → Explore → Loki"
+          - "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"

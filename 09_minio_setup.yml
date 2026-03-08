@@ -1,0 +1,411 @@
+---
+# =================================================================
+# 09_minio_setup.yml
+#
+# 목적: MinIO 분산 클러스터 설치 (3 replicas)
+#
+# 변경 이력:
+#   - 자격증명을 vars 하드코딩 → K8s Secret으로 분리
+#   - console.miso.local → s3console.miso.local
+#   - hosts: all → bastion/workers 플레이 분리
+#   - 기존 리소스 삭제 후 재설치 지원 (PVC 보존)
+#
+# 선행 조건:
+#   - 08_k8s_storage.yml (local-path provisioner)
+#   - 08_5_coredns_setup.yml (s3.miso.local DNS)
+#   - 06_k8s_ingress.yml (Nginx Ingress)
+#   - 07_cert_setup.yml (cert-manager, internal-ca-issuer)
+#
+# Secret 관리:
+#   minio-credentials Secret에 root user/password 저장
+#   StatefulSet은 Secret을 envFrom으로 참조
+# =================================================================
+
+# ------------------------------------------------------------------
+# PLAY 1. 워커 노드 디렉터리 준비
+# ------------------------------------------------------------------
+- name: "MinIO 워커 노드 디렉터리 준비"
+  hosts: workers
+  become: yes
+  gather_facts: false
+
+  vars:
+    minio_host_data_dir: "/data/minio"
+    local_path_base_dir: "/opt/local-path-provisioner"
+
+  tasks:
+    - name: "MinIO 데이터 디렉터리 생성"
+      ansible.builtin.file:
+        path: "{{ minio_host_data_dir }}"
+        state: directory
+        mode: "0775"
+        owner: "1001"
+        group: "1001"
+
+    - name: "local-path 기본 디렉터리 생성"
+      ansible.builtin.file:
+        path: "{{ local_path_base_dir }}"
+        state: directory
+        mode: "0777"
+
+# ------------------------------------------------------------------
+# PLAY 2. MinIO K8s 리소스 설치 (bastion에서 kubectl)
+# ------------------------------------------------------------------
+- name: "MinIO K8s 리소스 설치"
+  hosts: bastion
+  become: no
+  environment:
+    KUBECONFIG: "{{ lookup('env', 'HOME') }}/.kube/config"
+  gather_facts: false
+
+  vars:
+    minio_namespace: "default"
+    minio_replicas: 3
+    minio_image: "harbor.miso.local/miso/minio:latest"
+    # minio_image: "quay.io/minio/minio:latest"
+    minio_storageclass: "local-path"
+    minio_storage_size: "20Gi"
+    minio_s3_host: "s3.miso.local"         # 내부 DNS rewrite 전용 (Ingress 없음)
+    minio_console_host: "s3console.miso.local"  # Console 외부 접속용 (Ingress)
+    minio_secret_name: "minio-credentials"
+
+    # Console 접속 방식 선택
+    #   ingress  : HAProxy → Nginx Ingress → MinIO Console (외부 접속, IP 화이트리스트 적용)
+    #   tunnel   : Ingress 제거, bastion SSH 터널로만 접속 (91_tunnel_setting.yml 사용)
+    # 실행 옵션: -e console_access_mode=tunnel 또는 -e console_access_mode=ingress
+    console_access_mode: "ingress"
+
+    # Console 접근 허용 IP/대역 (console_access_mode=ingress 일 때만 사용)
+    # 예: "1.2.3.4/32,10.0.0.0/8"
+    minio_console_allowed_cidrs: "0.0.0.0/0"  # POC: 전체 허용 (운영 시 반드시 제한)
+
+    # 자격증명 (Secret으로 분리 - 플레이북에는 초기값만)
+    # 운영 환경에서는 Ansible Vault 또는 외부 Secret Manager 사용 권장
+    minio_root_user: "misoadmin"
+    minio_root_password: "misopassword"
+
+  tasks:
+    # -----------------------------------------------------------------
+    # STEP 1. 기존 리소스 존재 여부 확인
+    # -----------------------------------------------------------------
+    - name: "1. 기존 MinIO StatefulSet 존재 여부 확인"
+      ansible.builtin.shell: |
+        kubectl get statefulset minio -n {{ minio_namespace }} \
+          --no-headers 2>/dev/null | wc -l
+      register: minio_exists
+      changed_when: false
+
+    - name: "1. 기존 리소스 상태 출력"
+      ansible.builtin.debug:
+        msg: "StatefulSet 존재: {{ minio_exists.stdout | trim | int > 0 }}"
+
+    # -----------------------------------------------------------------
+    # STEP 1-b. 강제 재설치 (force_reinstall=true 시에만)
+    #
+    # 일반 실행 : kubectl apply → 변경분만 반영 (데이터/서비스 영향 없음)
+    # 강제 재설치: ansible-playbook ... -e force_reinstall=true
+    #              StatefulSet 삭제 후 재생성 (PVC는 보존)
+    # -----------------------------------------------------------------
+    - name: "1-b. 강제 재설치 시 기존 리소스 삭제 (PVC 보존)"
+      ansible.builtin.shell: |
+        kubectl delete statefulset minio -n {{ minio_namespace }} --ignore-not-found=true
+        kubectl delete service minio minio-internal -n {{ minio_namespace }} --ignore-not-found=true
+        kubectl delete ingress minio-ingress -n {{ minio_namespace }} --ignore-not-found=true
+        kubectl delete secret {{ minio_secret_name }} -n {{ minio_namespace }} --ignore-not-found=true
+        echo "정리 완료"
+      when:
+        - force_reinstall | default(false) | bool
+        - minio_exists.stdout | trim | int > 0
+      register: cleanup_out
+      changed_when: true
+
+    - name: "1-b. 정리 결과 출력"
+      ansible.builtin.debug:
+        msg: "{{ cleanup_out.stdout_lines | default(['재설치 스킵 (-e force_reinstall=true 로 실행 시 재설치)']) }}"
+
+    - name: "1-b. Pod 완전 종료 대기 (강제 재설치 시에만)"
+      ansible.builtin.shell: |
+        for i in $(seq 1 30); do
+          COUNT=$(kubectl get pods -n {{ minio_namespace }} \
+            -l app=minio --no-headers 2>/dev/null | wc -l)
+          if [ "$COUNT" -eq 0 ]; then
+            echo "Pod 종료 완료"
+            exit 0
+          fi
+          echo "대기 중... (${COUNT}개 남음)"
+          sleep 5
+        done
+        echo "타임아웃 - 강제 진행"
+      when:
+        - force_reinstall | default(false) | bool
+        - minio_exists.stdout | trim | int > 0
+      register: pod_wait
+      changed_when: false
+
+    - name: "1-b. Pod 종료 대기 결과"
+      ansible.builtin.debug:
+        msg: "{{ pod_wait.stdout_lines | default(['대기 스킵']) }}"
+
+    # STEP 2. Secret 생성 (자격증명 분리)
+    # -----------------------------------------------------------------
+    - name: "2. MinIO 자격증명 Secret 생성"
+      ansible.builtin.shell: |
+        kubectl create secret generic {{ minio_secret_name }} \
+          -n {{ minio_namespace }} \
+          --from-literal=MINIO_ROOT_USER={{ minio_root_user }} \
+          --from-literal=MINIO_ROOT_PASSWORD={{ minio_root_password }} \
+          --dry-run=client -o yaml | kubectl apply -f -
+      register: secret_out
+      changed_when: "'created' in secret_out.stdout or 'configured' in secret_out.stdout"
+
+    - name: "2. Secret 생성 결과"
+      ansible.builtin.debug:
+        msg: "{{ secret_out.stdout_lines }}"
+
+    # -----------------------------------------------------------------
+    # STEP 3. MinIO 매니페스트 생성
+    # -----------------------------------------------------------------
+    - name: "3. MinIO 매니페스트 생성"
+      ansible.builtin.copy:
+        dest: /tmp/minio-full.yaml
+        mode: "0644"
+        content: |
+          # ============================================================
+          # 1. Headless Service (MinIO 노드 간 통신)
+          # ============================================================
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: minio
+            namespace: {{ minio_namespace }}
+            labels:
+              app: minio
+          spec:
+            clusterIP: None
+            ports:
+              - name: api
+                port: 9000
+              - name: console
+                port: 9001
+            selector:
+              app: minio
+          ---
+          # ============================================================
+          # 2. ClusterIP Service (내부 앱 → MinIO S3 API)
+          # ============================================================
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: minio-internal
+            namespace: {{ minio_namespace }}
+            labels:
+              app: minio
+          spec:
+            type: ClusterIP
+            ports:
+              - name: api
+                port: 9000
+                targetPort: 9000
+            selector:
+              app: minio
+          ---
+          # ============================================================
+          # 3. StatefulSet (분산 클러스터 본체)
+          # ============================================================
+          apiVersion: apps/v1
+          kind: StatefulSet
+          metadata:
+            name: minio
+            namespace: {{ minio_namespace }}
+          spec:
+            serviceName: "minio"
+            replicas: {{ minio_replicas }}
+            selector:
+              matchLabels:
+                app: minio
+            template:
+              metadata:
+                labels:
+                  app: minio
+              spec:
+                affinity:
+                  podAntiAffinity:
+                    requiredDuringSchedulingIgnoredDuringExecution:
+                    - labelSelector:
+                        matchExpressions:
+                        - key: app
+                          operator: In
+                          values: ["minio"]
+                      topologyKey: "kubernetes.io/hostname"
+                containers:
+                - name: minio
+                  image: {{ minio_image }}
+                  args:
+                  - server
+                  - http://minio-{0...{{ (minio_replicas | int) - 1 }}}.minio.{{ minio_namespace }}.svc.cluster.local/data
+                  - --console-address
+                  - :9001
+                  # Secret에서 환경변수 주입 (하드코딩 제거)
+                  envFrom:
+                  - secretRef:
+                      name: {{ minio_secret_name }}
+                  ports:
+                  - containerPort: 9000
+                    name: api
+                  - containerPort: 9001
+                    name: console
+                  volumeMounts:
+                  - name: data
+                    mountPath: /data
+                  readinessProbe:
+                    httpGet:
+                      path: /minio/health/ready
+                      port: 9000
+                    initialDelaySeconds: 10
+                    periodSeconds: 10
+                  livenessProbe:
+                    httpGet:
+                      path: /minio/health/live
+                      port: 9000
+                    initialDelaySeconds: 30
+                    periodSeconds: 30
+            volumeClaimTemplates:
+            - metadata:
+                name: data
+              spec:
+                accessModes: [ "ReadWriteOnce" ]
+                storageClassName: "{{ minio_storageclass }}"
+                resources:
+                  requests:
+                    storage: {{ minio_storage_size }}
+          {% if console_access_mode == 'ingress' %}
+          ---
+          # ============================================================
+          # 4. Ingress (Console 전용 외부 접속)
+          #   console_access_mode=ingress 일 때만 생성
+          #   s3console.miso.local → HAProxy → Nginx Ingress → MinIO Console
+          #   IP 화이트리스트로 접근 제한
+          # ============================================================
+          apiVersion: networking.k8s.io/v1
+          kind: Ingress
+          metadata:
+            name: minio-ingress
+            namespace: {{ minio_namespace }}
+            annotations:
+              kubernetes.io/ingress.class: nginx
+              nginx.ingress.kubernetes.io/proxy-body-size: "0"
+              cert-manager.io/cluster-issuer: "internal-ca-issuer"
+              nginx.ingress.kubernetes.io/force-ssl-redirect: "true"
+              nginx.ingress.kubernetes.io/whitelist-source-range: "{{ minio_console_allowed_cidrs }}"
+          spec:
+            tls:
+            - hosts:
+              - {{ minio_console_host }}
+              secretName: minio-console-tls-secret
+            rules:
+            - host: {{ minio_console_host }}
+              http:
+                paths:
+                - path: /
+                  pathType: Prefix
+                  backend:
+                    service:
+                      name: minio
+                      port:
+                        number: 9001
+          {% endif %}
+
+    # -----------------------------------------------------------------
+    # STEP 3-b. tunnel 모드 시 기존 Ingress 제거
+    # -----------------------------------------------------------------
+    - name: "3-b. [tunnel 모드] 기존 minio-ingress 제거"
+      ansible.builtin.shell: |
+        kubectl delete ingress minio-ingress -n {{ minio_namespace }} --ignore-not-found=true
+        echo "Ingress 제거 완료 (tunnel 모드)"
+      when: console_access_mode == 'tunnel'
+      register: ingress_del
+      changed_when: "'deleted' in ingress_del.stdout"
+
+    - name: "3-b. Ingress 제거 결과"
+      ansible.builtin.debug:
+        msg: "{{ ingress_del.stdout_lines | default(['ingress 모드 - 스킵']) }}"
+
+    # -----------------------------------------------------------------
+    # STEP 4. 매니페스트 적용
+    # -----------------------------------------------------------------
+    - name: "4. MinIO 매니페스트 적용"
+      ansible.builtin.command: kubectl apply -f /tmp/minio-full.yaml
+      register: apply_out
+      changed_when: "'created' in apply_out.stdout or 'configured' in apply_out.stdout"
+
+    - name: "4. 적용 결과 출력"
+      ansible.builtin.debug:
+        msg: "{{ apply_out.stdout_lines }}"
+
+    # -----------------------------------------------------------------
+    # STEP 5. StatefulSet 롤아웃 대기
+    # -----------------------------------------------------------------
+    - name: "5. StatefulSet 롤아웃 대기 (최대 15분)"
+      ansible.builtin.command: >
+        kubectl -n {{ minio_namespace }} rollout status
+        statefulset/minio --timeout=900s
+      changed_when: false
+
+    # -----------------------------------------------------------------
+    # STEP 6. 최종 상태 확인
+    # -----------------------------------------------------------------
+    - name: "6. 최종 리소스 상태 확인"
+      ansible.builtin.shell: |
+        echo "=== Pods ==="
+        kubectl -n {{ minio_namespace }} get pods -l app=minio -o wide
+        echo
+        echo "=== PVC ==="
+        kubectl -n {{ minio_namespace }} get pvc | grep -E "data-minio|NAME"
+        echo
+        echo "=== Services ==="
+        kubectl -n {{ minio_namespace }} get svc | grep -E "minio|NAME"
+        echo
+        echo "=== Ingress ==="
+        kubectl -n {{ minio_namespace }} get ingress minio-ingress
+        echo
+        echo "=== Secret ==="
+        kubectl -n {{ minio_namespace }} get secret {{ minio_secret_name }}
+      register: status_out
+      changed_when: false
+
+    - name: "6. 최종 상태 출력"
+      ansible.builtin.debug:
+        msg: "{{ status_out.stdout_lines }}"
+
+    - name: "7. 임시 파일 정리"
+      ansible.builtin.file:
+        path: /tmp/minio-full.yaml
+        state: absent
+
+    # -----------------------------------------------------------------
+    # 완료 안내
+    # -----------------------------------------------------------------
+    - name: "[ 완료 안내 ]"
+      ansible.builtin.debug:
+        msg:
+          - "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          - " MinIO 설치 완료"
+          - "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          - ""
+          - " 자격증명 Secret: {{ minio_secret_name }}"
+          - "  kubectl get secret {{ minio_secret_name }} -o yaml"
+          - ""
+          - " 내부 접속 (앱에서):"
+          - "  S3 API : http://s3.miso.local:9000  (CoreDNS rewrite)"
+          - "  또는   : http://minio-internal:9000  (ClusterIP)"
+          - ""
+          - " 외부 접속 (브라우저):"
+          - "  {{ 'Console: https://s3console.miso.local  (Ingress - IP 화이트리스트 적용)' if console_access_mode == 'ingress' else 'Console: SSH 터널 모드 (91_tunnel_setting.yml 사용)' }}"
+          - "  {{ '접근 허용 IP: ' + minio_console_allowed_cidrs if console_access_mode == 'ingress' else '  bastion: sudo systemctl start tunnel-minio' }}"
+          - ""
+          - " 자격증명 확인:"
+          - "  kubectl get secret {{ minio_secret_name }}"
+          - "    -o go-template='{{ '{{' }}range $k,$v := .data{{ '}}' }}"
+          - "    {{ '{{' }}$k{{ '}}' }}: {{ '{{' }}$v | base64decode{{ '}}' }}"
+          - "    {{ '{{' }}end{{ '}}' }}'"
+          - "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"

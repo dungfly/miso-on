@@ -1,0 +1,33 @@
+---
+- name: "로컬 스토리지 자동 할당기 설치"
+  hosts: bastion
+  become: no
+  environment:
+    KUBECONFIG: "{{ lookup('env', 'HOME') }}/.kube/config"
+  tasks:
+    - name: "Local Path Provisioner 매니페스트 적용"
+      ansible.builtin.shell: |
+        kubectl apply -f http://10.1.5.10:8080/manifests/local-path-storage.yaml --validate=false
+
+    - name: "local-path StorageClass 등록 완료 대기"
+      ansible.builtin.shell: |
+        kubectl get storageclass local-path --no-headers 2>/dev/null | wc -l
+      register: sc_wait
+      until: sc_wait.stdout | trim | int > 0
+      retries: 20
+      delay: 5
+      changed_when: false
+
+    - name: "기본 스토리지 클래스로 설정"
+      ansible.builtin.shell: |
+        kubectl patch storageclass local-path \
+          -p '{"metadata": {"annotations":{"storageclass.kubernetes.io/is-default-class":"true"}}}'
+
+    - name: "설치 확인"
+      ansible.builtin.shell: kubectl get sc
+      register: sc_result
+      changed_when: false
+
+    - name: "결과 출력"
+      ansible.builtin.debug:
+        msg: "{{ sc_result.stdout_lines }}"

@@ -1,0 +1,24 @@
+---
+# =================================================================
+# PHASE 7 - 운영 설정 (SSL / ArgoCD / 터널)
+#
+# 실행: ansible-playbook -i hosts.ini phase7_operations.yml
+# 소요: 약 15분
+#
+# 포함 항목:
+#   - 와일드카드 SSL 인증서 적용  (19_ssl_setup.yml)
+#     ※ 사전 준비 필수: bash 00_gen_certs.sh → 인증서 파일 베스천 복사
+#     ※ Grafana(Phase 6) 설치 완료 후 실행해야 nginx TLS 설정 정상 동작
+#   - ArgoCD + Image Updater 설치 (18_argocd_setup.yml)
+#     ※ manifest 파일은 A2_image_collect.sh 실행 시 자동 수집됨
+#   - SSH 터널 설정               (91_tunnel_setting.yml)
+#
+# 개별 옵션:
+#   SSL만 재적용  : ansible-playbook -i hosts.ini 19_ssl_setup.yml
+#   ArgoCD 재설치 : ansible-playbook -i hosts.ini 18_argocd_setup.yml -e argocd_action=reinstall
+#   ArgoCD 제거   : ansible-playbook -i hosts.ini 18_argocd_setup.yml -e argocd_action=remove
+#   터널 전체 중지: ansible-playbook -i hosts.ini 91_tunnel_setting.yml -e tunnel_action=stop
+# =================================================================
+- import_playbook: 18_argocd_setup.yml
+- import_playbook: 19_ssl_setup.yml
+- import_playbook: 91_tunnel_setting.yml
