@@ -25,7 +25,7 @@
     vip_ip: "10.1.1.10"
 
     # Grafana VM (SNI 라우팅용)
-    monitor_ip: "10.1.5.100"
+    monitor_ip: "{{ hostvars[groups['monitoring'][0]]['ansible_host'] }}"
 
   tasks:
     - name: 1. Install HAProxy

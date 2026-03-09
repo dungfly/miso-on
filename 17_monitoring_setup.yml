@@ -38,8 +38,8 @@
       - { name: "db1",      ip: "10.1.4.10" }
       - { name: "db2",      ip: "10.1.4.20" }
       - { name: "db3",      ip: "10.1.4.30" }
-      - { name: "harbor1",  ip: "10.1.5.10" }
-      - { name: "monitor1", ip: "10.1.5.100" }
+      - { name: "harbor1",  ip: "{{ hostvars['harbor1']['ansible_host'] }}" }
+      - { name: "monitor1", ip: "{{ hostvars['monitor1']['ansible_host'] }}" }
 
   tasks:
     # ---------------------------------------------------------------
@@ -71,10 +71,10 @@
         content: "{{ item.content }}"
       loop:
         - dest: /etc/apt/sources.list.d/miso-local-common.list
-          content: "deb [trusted=yes] http://10.1.5.10:8080/debs/common ./
+          content: "deb [trusted=yes] http://{{ hostvars[groups['harbor'][0]]['ansible_host'] }}:8080/debs/common ./
 "
         - dest: /etc/apt/sources.list.d/miso-local-docker.list
-          content: "deb [trusted=yes] http://10.1.5.10:8080/debs/docker ./
+          content: "deb [trusted=yes] http://{{ hostvars[groups['harbor'][0]]['ansible_host'] }}:8080/debs/docker ./
 "
       when: not docker_repo_check.stat.exists
 
@@ -158,7 +158,7 @@
             # Harbor
             - job_name: 'harbor'
               static_configs:
-                - targets: ['10.1.5.10:9090']
+                - targets: ['{{ hostvars[groups[''harbor''][0]][''ansible_host''] }}:9090']
               metrics_path: /metrics
 
             # PostgreSQL (CNPG exporter)
@@ -423,6 +423,13 @@
         owner: "472"
         group: "472"
         recurse: yes
+
+    - name: "5-a. Harbor Docker 로그인"
+      ansible.builtin.shell: |
+        echo "Harbor12345" | docker login harbor.miso.local \
+          -u admin --password-stdin
+      changed_when: false
+      no_log: true
 
     - name: "5. 모니터링 스택 기동"
       ansible.builtin.shell: |

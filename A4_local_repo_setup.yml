@@ -25,7 +25,8 @@
   become: yes
   gather_facts: false
   vars:
-    mirror_base: "http://10.1.5.10:8080/debs"
+    harbor_ip: "{{ hostvars[groups['harbor'][0]]['ansible_host'] }}"
+    mirror_base: "http://{{ harbor_ip }}:8080/debs"
 
   tasks:
     - name: "기존 외부 저장소 비활성화"
@@ -41,7 +42,7 @@
         # kubernetes, docker 등 외부 저장소 파일도 비활성화
         for f in /etc/apt/sources.list.d/*.list; do
           [ -f "$f" ] || continue
-          grep -q "miso.local\|10.1.5.10" "$f" && continue  # 로컬 저장소는 건드리지 않음
+          grep -q "miso.local\|{{ harbor_ip }}" "$f" && continue  # 로컬 저장소는 건드리지 않음
           mv "$f" "${f}.bak" 2>/dev/null || true
         done
         echo "외부 저장소 비활성화 완료"
@@ -66,7 +67,7 @@
   become: yes
   gather_facts: false
   vars:
-    mirror_base: "http://10.1.5.10:8080/debs"
+    mirror_base: "http://{{ harbor_ip }}:8080/debs"
 
   tasks:
     - name: "k8s 로컬 저장소 등록"
@@ -89,7 +90,7 @@
   become: yes
   gather_facts: false
   vars:
-    mirror_base: "http://10.1.5.10:8080/debs"
+    mirror_base: "http://{{ harbor_ip }}:8080/debs"
 
   tasks:
     - name: "외부 저장소 비활성화"
@@ -97,7 +98,7 @@
         set -e
         for f in /etc/apt/sources.list /etc/apt/sources.list.d/*.list; do
           [ -f "$f" ] || continue
-          grep -q "miso.local\|10.1.5.10" "$f" && continue
+          grep -q "miso.local\|{{ harbor_ip }}" "$f" && continue
           sudo mv "$f" "${f}.disabled" 2>/dev/null || true
         done
       args:
@@ -130,7 +131,7 @@
   become: yes
   gather_facts: false
   vars:
-    mirror_base: "http://10.1.5.10:8080/debs"
+    mirror_base: "http://{{ harbor_ip }}:8080/debs"
 
   tasks:
     - name: "haproxy 로컬 저장소 등록"

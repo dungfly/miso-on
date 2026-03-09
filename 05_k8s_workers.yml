@@ -3,6 +3,8 @@
   hosts: workers
   become: yes
   vars:
+    harbor_ip: "{{ hostvars[groups['harbor'][0]]['ansible_host'] }}"
+    monitor_ip: "{{ hostvars[groups['monitoring'][0]]['ansible_host'] }}"
     k8s_version: "1.30"
     # master API endpoint (HAProxy VIP)
     api_endpoint: "10.1.1.10"
@@ -70,25 +72,22 @@
     # ---------------------------------------------------------------
     # STEP 3. Kubernetes 패키지 설치
     # ---------------------------------------------------------------
-    - name: 9. /etc/apt/keyrings 디렉토리 생성
-      file:
-        path: /etc/apt/keyrings
-        state: directory
-        mode: '0755'
+    - name: 9. K8s 로컬 저장소 확인 (A4에서 등록됐어야 함)
+      ansible.builtin.stat:
+        path: /etc/apt/sources.list.d/miso-local-k8s.list
+      register: k8s_repo_check
 
-    - name: 10. K8s 저장소 GPG 키 등록
-      shell: |
-        set -e
-        curl -fsSL https://pkgs.k8s.io/core:/stable:/v{{ k8s_version }}/deb/Release.key \
-          | gpg --dearmor --yes -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
-      args:
-        creates: /etc/apt/keyrings/kubernetes-apt-keyring.gpg
-
-    - name: 11. K8s apt 저장소 등록
-      copy:
-        dest: /etc/apt/sources.list.d/kubernetes.list
+    - name: 10. K8s 로컬 저장소 긴급 등록 (미등록 시)
+      ansible.builtin.copy:
+        dest: /etc/apt/sources.list.d/miso-local-k8s.list
         content: |
-          deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v{{ k8s_version }}/deb/ /
+          deb [trusted=yes] http://{{ harbor_ip }}:8080/debs/k8s ./
+      when: not k8s_repo_check.stat.exists
+
+    - name: 11. 외부 K8s 저장소 비활성화 (폐쇄망)
+      ansible.builtin.file:
+        path: /etc/apt/sources.list.d/kubernetes.list
+        state: absent
 
     - name: 12. kubelet / kubeadm / kubectl 설치
       apt:

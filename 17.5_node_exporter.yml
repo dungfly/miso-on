@@ -28,7 +28,7 @@
   environment:
     KUBECONFIG: "{{ lookup('env', 'HOME') }}/.kube/config"
   vars:
-    loki_url: "http://10.1.5.100:3100/loki/api/v1/push"
+    loki_url: "http://{{ hostvars[groups['monitoring'][0]]['ansible_host'] }}:3100/loki/api/v1/push"
     harbor: "harbor.miso.local/miso"
 
   tasks:
@@ -36,6 +36,20 @@
       ansible.builtin.shell: |
         kubectl create namespace monitoring --dry-run=client -o yaml | kubectl apply -f -
       changed_when: false
+
+    - name: "1-b. harbor-registry-secret을 monitoring 네임스페이스에 복사"
+      ansible.builtin.shell: |
+        kubectl get secret harbor-registry-secret -n monitoring 2>/dev/null && exit 0
+        kubectl get secret harbor-registry-secret -n default -o yaml | \
+          sed "s/namespace: default/namespace: monitoring/" | \
+          kubectl apply -f -
+      changed_when: true
+
+    - name: "1-c. default ServiceAccount에 imagePullSecrets 등록"
+      ansible.builtin.shell: |
+        kubectl patch serviceaccount default -n monitoring \
+          -p '{"imagePullSecrets":[{"name":"harbor-registry-secret"}]}'
+      changed_when: true
 
     # ---------------------------------------------------------------
     # node-exporter DaemonSet
@@ -61,6 +75,8 @@
             spec:
               hostNetwork: true
               hostPID: true
+              imagePullSecrets:
+                - name: harbor-registry-secret
               tolerations:
                 - operator: Exists
               containers:
@@ -242,6 +258,8 @@
                 app: promtail
             spec:
               serviceAccountName: promtail
+              imagePullSecrets:
+                - name: harbor-registry-secret
               tolerations:
                 - operator: Exists    # db taint 포함 전체 노드 배포
               containers:
@@ -322,7 +340,7 @@
   gather_facts: true
   vars:
     harbor: "harbor.miso.local/miso"
-    loki_url: "http://10.1.5.100:3100/loki/api/v1/push"
+    loki_url: "http://{{ hostvars[groups['monitoring'][0]]['ansible_host'] }}:3100/loki/api/v1/push"
 
   tasks:
     - name: "1. 설정 디렉토리 생성"
@@ -363,34 +381,32 @@
                     expression: "^$"
 
     - name: "3. node-exporter 컨테이너 실행"
-      community.docker.docker_container:
-        name: node-exporter
-        image: "{{ harbor }}/node-exporter:v1.7.0"
-        state: started
-        restart_policy: unless-stopped
-        network_mode: host
-        pid_mode: host
-        volumes:
-          - /proc:/host/proc:ro
-          - /sys:/host/sys:ro
-          - /:/host/root:ro
-        command:
-          - '--path.procfs=/host/proc'
-          - '--path.sysfs=/host/sys'
-          - '--path.rootfs=/host/root'
-          - '--collector.filesystem.mount-points-exclude=^/(sys|proc|dev|host|etc)($|/)'
+      ansible.builtin.shell: |
+        docker rm -f node-exporter 2>/dev/null || true
+        docker run -d --name node-exporter \
+          --restart unless-stopped \
+          --network host \
+          --pid host \
+          -v /proc:/host/proc:ro \
+          -v /sys:/host/sys:ro \
+          -v /:/host/root:ro \
+          {{ harbor }}/node-exporter:v1.7.0 \
+          --path.procfs=/host/proc \
+          --path.sysfs=/host/sys \
+          --path.rootfs=/host/root \
+          --collector.filesystem.mount-points-exclude='^/(sys|proc|dev|host|etc)($$|/)'
+      changed_when: true
 
     - name: "4. Promtail 컨테이너 실행"
-      community.docker.docker_container:
-        name: promtail
-        image: "{{ harbor }}/promtail:2.9.8"
-        state: started
-        restart_policy: unless-stopped
-        volumes:
-          - /opt/exporters/promtail:/etc/promtail
-          - /var/log:/var/log:ro
-        command:
-          - '-config.file=/etc/promtail/promtail.yml'
+      ansible.builtin.shell: |
+        docker rm -f promtail 2>/dev/null || true
+        docker run -d --name promtail \
+          --restart unless-stopped \
+          -v /opt/exporters/promtail:/etc/promtail \
+          -v /var/log:/var/log:ro \
+          {{ harbor }}/promtail:2.9.8 \
+          -config.file=/etc/promtail/promtail.yml
+      changed_when: true
 
     - name: "5. 컨테이너 상태 확인"
       ansible.builtin.shell: |

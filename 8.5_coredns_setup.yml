@@ -52,9 +52,9 @@
     # Monitor VM 직접 IP 매핑 (K8s Ingress 미경유)
     hosts_rules: |
       # ── 모니터링 외부 접속 도메인 (ansible 자동 추가) ───────────
-      10.1.5.100 monitor.miso.local
-      10.1.5.100 prometheus.miso.local
-      10.1.5.100 alertmanager.miso.local
+      {{ hostvars[groups['monitoring'][0]]['ansible_host'] }} monitor.miso.local
+      {{ hostvars[groups['monitoring'][0]]['ansible_host'] }} prometheus.miso.local
+      {{ hostvars[groups['monitoring'][0]]['ansible_host'] }} alertmanager.miso.local
       # ────────────────────────────────────────────────────────────
 
   tasks:

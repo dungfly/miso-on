@@ -29,8 +29,8 @@
     harbor_admin_user: "admin"
     harbor_admin_password: "Harbor12345"
 
-    argocd_manifest: "http://10.1.5.10:8080/manifests/argocd-install.yaml"
-    image_updater_manifest: "http://10.1.5.10:8080/manifests/argocd-image-updater.yaml"
+    argocd_manifest: "http://{{ hostvars[groups['harbor'][0]]['ansible_host'] }}:8080/manifests/argocd-install.yaml"
+    image_updater_manifest: "http://{{ hostvars[groups['harbor'][0]]['ansible_host'] }}:8080/manifests/argocd-image-updater.yaml"
 
   tasks:
     # ---------------------------------------------------------------
@@ -151,8 +151,8 @@
         corefile = cm['data']['Corefile']
         entry = '      10.1.1.10 argocd.miso.local\n'
         corefile = corefile.replace(
-          '10.1.5.10 harbor.miso.local\n',
-          '10.1.5.10 harbor.miso.local\n' + entry
+          '{{ hostvars[groups["harbor"][0]]["ansible_host"] }} harbor.miso.local\n',
+          '{{ hostvars[groups["harbor"][0]]["ansible_host"] }} harbor.miso.local\n' + entry
         )
         cm['data']['Corefile'] = corefile
         print(json.dumps(cm))

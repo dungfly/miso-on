@@ -6,11 +6,13 @@
     KUBECONFIG: "{{ lookup('env', 'HOME') }}/.kube/config"
   gather_facts: false
   vars:
+    harbor_ip: "{{ hostvars[groups['harbor'][0]]['ansible_host'] }}"
+    monitor_ip: "{{ hostvars[groups['monitoring'][0]]['ansible_host'] }}"
     cnpg_manifest_src: "./cnpg-1.22.1.yaml"     # 컨트롤 머신(레포)에 있는 파일
     cnpg_manifest_dest: "/tmp/cnpg-1.22.1.yaml" # bastion에 둘 위치
 
     allow_online_download: true
-    cnpg_manifest_url: "http://10.1.5.10:8080/manifests/cnpg-1.22.1.yaml"
+    cnpg_manifest_url: "http://{{ harbor_ip }}:8080/manifests/cnpg-1.22.1.yaml"
 
   tasks:
     - name: "Check CNPG manifest exists on controller (repo file)"

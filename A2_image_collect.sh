@@ -131,32 +131,49 @@ https://pkgs.k8s.io/core:/stable:/v1.30/deb/ /" \
   | sudo tee /etc/apt/sources.list.d/kubernetes.list > /dev/null
 
 # Docker 저장소 등록 (이미 A1에서 등록됐지만 혹시 없을 경우 대비)
-if [ ! -f /etc/apt/keyrings/docker.gpg ]; then
+DOCKER_REPO_UPDATED=false
+if [ ! -f /etc/apt/keyrings/docker.gpg ] || [ ! -f /etc/apt/sources.list.d/docker.list ]; then
   echo "  Docker 저장소 등록..."
+  sudo mkdir -p /etc/apt/keyrings
   curl -fsSL https://download.docker.com/linux/ubuntu/gpg \
     | sudo gpg --dearmor --yes -o /etc/apt/keyrings/docker.gpg
   echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/docker.gpg] \
 https://download.docker.com/linux/ubuntu jammy stable" \
     | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
+  DOCKER_REPO_UPDATED=true
 fi
 
 sudo apt-get update -qq
+
+# Docker 저장소를 새로 등록한 경우 한 번 더 update (캐시 반영 보장)
+if [ "${DOCKER_REPO_UPDATED}" = "true" ]; then
+  echo "  Docker 저장소 재등록 후 추가 update..."
+  sudo apt-get update -qq
+fi
 
 # 그룹별 패키지 다운로드 함수
 download_pkgs() {
   local group=$1
   shift
   local dest="${DEBS_BASE}/${group}"
-  echo "  [deb/${group}] $*"
+  local pkg_count
+  pkg_count=$(ls "${dest}"/*.deb 2>/dev/null | wc -l)
+  echo "  [deb/${group}] $* (현재 ${pkg_count}개)"
+
+  # 이미 deb가 있고 Packages 인덱스도 있으면 skip
+  if [ "${pkg_count}" -gt 0 ] && [ -s "${dest}/Packages" ]; then
+    echo "    ✓ 이미 수집됨 (skip)"
+    return 0
+  fi
 
   # partial 디렉토리 생성 (apt 요구사항)
   sudo mkdir -p "${dest}/partial"
 
-  sudo apt-get install --download-only -y "$@" \
+  sudo apt-get install --download-only --reinstall -y "$@" \
     -o Dir::Cache::archives="${dest}" \
     -o Dir::Cache::pkgcache="" \
     -o Dir::Cache::srcpkgcache="" \
-    2>&1 | grep -E "^Get:|already|^\.\/" || true
+    2>&1 | grep -E "^Get:|already|^\./" || true
 
   # lock/partial 정리
   sudo rm -f "${dest}/lock"

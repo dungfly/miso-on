@@ -7,7 +7,7 @@
   tasks:
     - name: "Local Path Provisioner 매니페스트 적용"
       ansible.builtin.shell: |
-        kubectl apply -f http://10.1.5.10:8080/manifests/local-path-storage.yaml --validate=false
+        kubectl apply -f http://{{ harbor_ip }}:8080/manifests/local-path-storage.yaml --validate=false
 
     - name: "local-path StorageClass 등록 완료 대기"
       ansible.builtin.shell: |

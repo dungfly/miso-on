@@ -84,13 +84,13 @@
 # ---------------------------------------------------------------
 # PLAY 2-b. Bastion /etc/hosts 등록 (ClusterIP 직접 접근 불가)
 # ---------------------------------------------------------------
-- name: "Bastion /etc/hosts에 miso.local 도메인 등록"
-  hosts: bastion
+- name: "Bastion + Monitoring /etc/hosts에 miso.local 도메인 등록"
+  hosts: bastion:monitoring
   become: yes
   gather_facts: false
   vars:
-    harbor_ip: "10.1.5.10"
-    monitor_ip: "10.1.5.100"
+    harbor_ip: "{{ hostvars[groups['harbor'][0]]['ansible_host'] }}"
+    monitor_ip: "{{ hostvars[groups['monitoring'][0]]['ansible_host'] }}"
   tasks:
     - name: "Harbor CA 시스템 신뢰 등록"
       ansible.builtin.copy:
@@ -119,6 +119,28 @@
         - alertmanager.miso.local
         - dashboard.miso.local
         - s3console.miso.local
+
+    - name: "Docker daemon Harbor CA 등록 (monitoring 서버용)"
+      ansible.builtin.file:
+        path: /etc/docker/certs.d/harbor.miso.local
+        state: directory
+        mode: "0755"
+      when: inventory_hostname in groups['monitoring']
+
+    - name: "Docker daemon에 Harbor CA 복사 (monitoring 서버용)"
+      ansible.builtin.copy:
+        src: /tmp/harbor-ca.crt
+        dest: /etc/docker/certs.d/harbor.miso.local/ca.crt
+        mode: "0644"
+      when: inventory_hostname in groups['monitoring']
+      notify: Restart docker
+
+  handlers:
+    - name: Restart docker
+      ansible.builtin.systemd:
+        name: docker
+        state: restarted
+      ignore_errors: yes
 
 # ---------------------------------------------------------------
 # PLAY 3. K8s 노드 containerd 인증서 등록
@@ -223,12 +245,12 @@
         if echo "$COREFILE" | grep -q "hosts {"; then
           # 기존 hosts 블록의 fallthrough 앞에 harbor 항목 삽입
           kubectl get configmap coredns -n kube-system -o json | \
-          sed 's/      fallthrough/      10.1.5.10 harbor.miso.local\n      fallthrough/' | \
+          sed 's/      fallthrough/      {{ harbor_ip }} harbor.miso.local\n      fallthrough/' | \
           kubectl apply -f -
         else
           # hosts 블록이 없으면 ready 다음에 새 블록 생성
           kubectl get configmap coredns -n kube-system -o json | \
-          sed 's/    ready/    ready\n    hosts {\n      10.1.5.10 harbor.miso.local\n      fallthrough\n    }/' | \
+          sed 's/    ready/    ready\n    hosts {\n      {{ harbor_ip }} harbor.miso.local\n      fallthrough\n    }/' | \
           kubectl apply -f -
         fi
       when: harbor_dns_check.stdout == "0"

@@ -3,3 +3,5 @@ bastion-pkgs/
 *.tar.gz
 *.zip
 *.pem
+*.key
+*.crt

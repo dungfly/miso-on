@@ -5,6 +5,8 @@
   environment:
     KUBECONFIG: "{{ lookup('env', 'HOME') }}/.kube/config"
   vars:
+    harbor_ip: "{{ hostvars[groups['harbor'][0]]['ansible_host'] }}"
+    monitor_ip: "{{ hostvars[groups['monitoring'][0]]['ansible_host'] }}"
     ingress_version: "controller-v1.10.1" # v1.30 호환 버전
 
   tasks:
@@ -16,7 +18,7 @@
 
     - name: "Bare-metal용 Nginx Ingress manifest 적용"
       ansible.builtin.shell: |
-        kubectl apply -f http://10.1.5.10:8080/manifests/ingress-nginx.yaml --validate=false
+        kubectl apply -f http://{{ harbor_ip }}:8080/manifests/ingress-nginx.yaml --validate=false
       when: ns_check.rc != 0
 
     - name: "Ingress Controller 서비스의 NodePort를 30080, 30443으로 고정"

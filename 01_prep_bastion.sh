@@ -36,51 +36,39 @@ echo ">>> [Bastion] 관리 서버 설정을 시작합니다."
 # =================================================================
 # 1. 패키지 설치 (인터넷 / 폐쇄망 자동 분기)
 # =================================================================
-BASTION_PKGS="ansible jq curl git vim net-tools htop chrony ca-certificates gnupg kubectl"
-OFFLINE_BUNDLE="./bastion-pkgs"
+BASTION_PKGS_COMMON="python3-pip jq curl git vim net-tools htop chrony ca-certificates gnupg"
+HARBOR_REPO="http://10.1.5.10:8080/debs"
 
-if [ -d "${OFFLINE_BUNDLE}" ] && [ "$(ls ${OFFLINE_BUNDLE}/*.deb 2>/dev/null | wc -l)" -gt 0 ]; then
-  # -------------------------------------------------------
-  # 폐쇄망: 로컬 deb 번들로 설치
-  # -------------------------------------------------------
-  echo ">>> [오프라인] bastion-pkgs/ 번들에서 설치합니다."
+# -------------------------------------------------------
+# Harbor 로컬 저장소 사용 (폐쇄망 기본)
+# Harbor가 먼저 구성되어 있어야 함
+# -------------------------------------------------------
+echo ">>> [로컬저장소] Harbor nginx 저장소에서 설치합니다."
 
-  # 로컬 임시 저장소 등록
-  sudo tee /etc/apt/sources.list.d/miso-bastion-local.list << APTEOF
-deb [trusted=yes] file://${PWD}/bastion-pkgs ./
+# Harbor 로컬 저장소 등록
+sudo tee /etc/apt/sources.list.d/miso-local-common.list << APTEOF
+deb [trusted=yes] ${HARBOR_REPO}/common ./
 APTEOF
 
-  # Packages 인덱스가 없으면 생성
-  if [ ! -f "${OFFLINE_BUNDLE}/Packages" ]; then
-    echo ">>> Packages 인덱스 생성 중..."
-    (cd "${OFFLINE_BUNDLE}" && sudo apt-ftparchive packages . | sudo tee Packages > /dev/null)
-  fi
+sudo tee /etc/apt/sources.list.d/miso-local-k8s.list << APTEOF
+deb [trusted=yes] ${HARBOR_REPO}/k8s ./
+APTEOF
 
-  sudo apt-get update -qq
-  sudo apt-get install -y --no-install-recommends ${BASTION_PKGS}
+# 외부 저장소 비활성화
+sudo rm -f /etc/apt/sources.list.d/kubernetes.list
 
-else
-  # -------------------------------------------------------
-  # 인터넷: 외부 저장소에서 설치
-  # -------------------------------------------------------
-  echo ">>> [온라인] 외부 저장소에서 설치합니다."
-
-  K8S_VERSION="1.30"
-  sudo mkdir -p /etc/apt/keyrings
-
-  # K8s 저장소 등록 (kubectl용)
-  curl -fsSL https://pkgs.k8s.io/core:/stable:/v${K8S_VERSION}/deb/Release.key \
-    | sudo gpg --dearmor --yes -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
-  echo "deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] \
-https://pkgs.k8s.io/core:/stable:/v${K8S_VERSION}/deb/ /" \
-    | sudo tee /etc/apt/sources.list.d/kubernetes.list > /dev/null
-
-  sudo apt-get update -qq
-  sudo apt-get install -y ${BASTION_PKGS}
-fi
+sudo apt-get update -qq
+sudo apt-get install -y --no-install-recommends ${BASTION_PKGS_COMMON} kubectl
 
 echo ">>> 패키지 설치 완료"
 kubectl version --client=true
+
+# =================================================================
+# 1-b. pip으로 Ansible 최신버전 설치 (apt ansible은 구버전)
+# =================================================================
+echo ">>> Ansible 최신버전 pip 설치"
+pip3 install --upgrade ansible --break-system-packages
+ansible --version | head -1
 
 # =================================================================
 # 2. miso-key.pem 설치

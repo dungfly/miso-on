@@ -38,18 +38,23 @@
         enabled: yes
         daemon_reload: yes
 
-    - name: Add Kubernetes apt key
-      ansible.builtin.get_url:
-        url: https://pkgs.k8s.io/core:/stable:/v1.30/deb/Release.key
-        dest: /etc/apt/keyrings/kubernetes-apt-keyring.asc
-        mode: '0644'
+    - name: K8s 로컬 저장소 확인 (A4에서 등록됐어야 함)
+      ansible.builtin.stat:
+        path: /etc/apt/sources.list.d/miso-local-k8s.list
+      register: k8s_repo_check
 
-    - name: Add Kubernetes apt repo
+    - name: K8s 로컬 저장소 긴급 등록 (미등록 시)
       ansible.builtin.copy:
-        dest: /etc/apt/sources.list.d/kubernetes.list
+        dest: /etc/apt/sources.list.d/miso-local-k8s.list
         mode: '0644'
         content: |
-          deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.asc] https://pkgs.k8s.io/core:/stable:/v1.30/deb/ /
+          deb [trusted=yes] http://{{ harbor_ip }}:8080/debs/k8s ./
+      when: not k8s_repo_check.stat.exists
+
+    - name: 외부 K8s 저장소 비활성화 (폐쇄망)
+      ansible.builtin.file:
+        path: /etc/apt/sources.list.d/kubernetes.list
+        state: absent
 
     - name: Install kubelet/kubeadm/kubectl
       ansible.builtin.apt:
@@ -107,6 +112,8 @@
   become: no
   gather_facts: false
   vars:
+    harbor_ip: "{{ hostvars[groups['harbor'][0]]['ansible_host'] }}"
+    monitor_ip: "{{ hostvars[groups['monitoring'][0]]['ansible_host'] }}"
     # Jinja2로 미리 IP 목록 생성 (shell for 루프와 혼용 방지)
     db_node_ips: "{{ groups['db_nodes'] | map('extract', hostvars, 'ansible_host') | list }}"
   tasks:
