@@ -9,7 +9,7 @@
 # 동작:
 #   1. K8s 전체 노드에 Harbor CA 시스템 신뢰 등록
 #   2. K8s 노드 containerd에 Harbor 인증서 등록
-#   3. CoreDNS에 harbor.miso.local 등록
+#   3. CoreDNS에 {{ harbor_domain }} 등록
 # =================================================================
 
 # ---------------------------------------------------------------
@@ -65,14 +65,14 @@
         state: directory
         mode: "0755"
 
-    - name: "miso.local DNS → CoreDNS 라우팅 설정"
+    - name: "{{ base_domain }} DNS → CoreDNS 라우팅 설정"
       ansible.builtin.copy:
         dest: /etc/systemd/resolved.conf.d/miso-local.conf
         mode: "0644"
         content: |
           [Resolve]
           DNS=10.96.0.10
-          Domains=~miso.local
+          Domains=~{{ base_domain }}
       notify: Restart systemd-resolved
 
   handlers:
@@ -84,7 +84,7 @@
 # ---------------------------------------------------------------
 # PLAY 2-b. Bastion /etc/hosts 등록 (ClusterIP 직접 접근 불가)
 # ---------------------------------------------------------------
-- name: "Bastion + Monitoring /etc/hosts에 miso.local 도메인 등록"
+- name: "Bastion + Monitoring /etc/hosts에 {{ base_domain }} 도메인 등록"
   hosts: bastion:monitoring
   become: yes
   gather_facts: false
@@ -102,10 +102,10 @@
       ansible.builtin.shell: update-ca-certificates
       changed_when: true
 
-    - name: "harbor.miso.local /etc/hosts 등록"
+    - name: "{{ harbor_domain }} /etc/hosts 등록"
       ansible.builtin.lineinfile:
         path: /etc/hosts
-        line: "{{ harbor_ip }} harbor.miso.local"
+        line: "{{ harbor_ip }} {{ harbor_domain }}"
         state: present
 
     - name: "monitoring 도메인 /etc/hosts 등록"
@@ -114,15 +114,15 @@
         line: "{{ monitor_ip }} {{ item }}"
         state: present
       loop:
-        - monitor.miso.local
-        - prometheus.miso.local
-        - alertmanager.miso.local
-        - dashboard.miso.local
-        - s3console.miso.local
+        - "{{ monitor_domain }}"
+        - "{{ prometheus_domain }}"
+        - "{{ alertmanager_domain }}"
+        - "{{ dashboard_domain }}"
+        - "{{ minio_console_domain }}"
 
     - name: "Docker daemon Harbor CA 등록 (monitoring 서버용)"
       ansible.builtin.file:
-        path: /etc/docker/certs.d/harbor.miso.local
+        path: /etc/docker/certs.d/{{ harbor_domain }}
         state: directory
         mode: "0755"
       when: inventory_hostname in groups['monitoring']
@@ -130,7 +130,7 @@
     - name: "Docker daemon에 Harbor CA 복사 (monitoring 서버용)"
       ansible.builtin.copy:
         src: /tmp/harbor-ca.crt
-        dest: /etc/docker/certs.d/harbor.miso.local/ca.crt
+        dest: /etc/docker/certs.d/{{ harbor_domain }}/ca.crt
         mode: "0644"
       when: inventory_hostname in groups['monitoring']
       notify: Restart docker
@@ -150,7 +150,7 @@
   become: yes
   gather_facts: false
   vars:
-    harbor_hostname: "harbor.miso.local"
+    harbor_hostname: "{{ harbor_domain }}"
   tasks:
     - name: "containerd certs.d 디렉토리 생성"
       ansible.builtin.file:
@@ -188,7 +188,7 @@
   vars:
     harbor_user: "admin"
     harbor_password: "Harbor12345"
-    harbor_server: "harbor.miso.local"
+    harbor_server: "{{ harbor_domain }}"
   tasks:
     - name: "harbor-registry-secret 존재 여부 확인"
       ansible.builtin.shell: |
@@ -222,19 +222,19 @@
       changed_when: true
 
 # ---------------------------------------------------------------
-# PLAY 4. CoreDNS에 harbor.miso.local 등록
+# PLAY 4. CoreDNS에 {{ harbor_domain }} 등록
 # ---------------------------------------------------------------
-- name: "CoreDNS harbor.miso.local 등록"
+- name: "CoreDNS {{ harbor_domain }} 등록"
   hosts: bastion
   become: no
   gather_facts: false
   environment:
     KUBECONFIG: "{{ lookup('env', 'HOME') }}/.kube/config"
   tasks:
-    - name: "harbor.miso.local 이미 등록됐는지 확인"
+    - name: "{{ harbor_domain }} 이미 등록됐는지 확인"
       ansible.builtin.shell: |
         kubectl get configmap coredns -n kube-system \
-          -o jsonpath='{.data.Corefile}' | grep -c "harbor.miso.local" || true
+          -o jsonpath='{.data.Corefile}' | grep -c "{{ harbor_domain }}" || true
       register: harbor_dns_check
       changed_when: false
 
@@ -245,12 +245,12 @@
         if echo "$COREFILE" | grep -q "hosts {"; then
           # 기존 hosts 블록의 fallthrough 앞에 harbor 항목 삽입
           kubectl get configmap coredns -n kube-system -o json | \
-          sed 's/      fallthrough/      {{ harbor_ip }} harbor.miso.local\n      fallthrough/' | \
+          sed 's/      fallthrough/      {{ harbor_ip }} {{ harbor_domain }}\n      fallthrough/' | \
           kubectl apply -f -
         else
           # hosts 블록이 없으면 ready 다음에 새 블록 생성
           kubectl get configmap coredns -n kube-system -o json | \
-          sed 's/    ready/    ready\n    hosts {\n      {{ harbor_ip }} harbor.miso.local\n      fallthrough\n    }/' | \
+          sed 's/    ready/    ready\n    hosts {\n      {{ harbor_ip }} {{ harbor_domain }}\n      fallthrough\n    }/' | \
           kubectl apply -f -
         fi
       when: harbor_dns_check.stdout == "0"
@@ -263,9 +263,9 @@
       when: dns_update is changed
       changed_when: true
 
-    - name: "harbor.miso.local DNS 확인"
+    - name: "{{ harbor_domain }} DNS 확인"
       ansible.builtin.shell: |
-        nslookup harbor.miso.local 2>/dev/null || true
+        nslookup {{ harbor_domain }} 2>/dev/null || true
       register: dns_check
       changed_when: false
       failed_when: false
@@ -282,7 +282,7 @@
           - "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
           - " - K8s 전체 노드 시스템 CA 등록 완료"
           - " - containerd Harbor 인증서 등록 완료"
-          - " - CoreDNS harbor.miso.local 등록 완료"
+          - " - CoreDNS {{ harbor_domain }} 등록 완료"
           - ""
           - " 다음 단계:"
           - "   ansible-playbook -i hosts.ini phase4_infra_services.yml"

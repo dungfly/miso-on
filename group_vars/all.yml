@@ -1,0 +1,95 @@
+---
+# =============================================================================
+# group_vars/all.yml  ─  전체 플레이북 공통 변수
+# 이 파일의 변수를 수정하면 모든 플레이북에 자동 반영됩니다.
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# [1] 인프라 IP  (hosts.ini 의 ansible_host 를 동적으로 참조)
+# -----------------------------------------------------------------------------
+harbor_ip:  "{{ hostvars[groups['harbor'][0]]['ansible_host'] }}"
+monitor_ip: "{{ hostvars[groups['monitoring'][0]]['ansible_host'] }}"
+
+# -----------------------------------------------------------------------------
+# [2] 도메인 설정  ★ 실제 도메인으로 변경하세요 ★
+# -----------------------------------------------------------------------------
+base_domain: "miso.local"          # 예) example.com
+
+# 서비스별 서브도메인 (base_domain 기반 자동 조합)
+harbor_domain:       "harbor.{{ base_domain }}"
+argocd_domain:       "argocd.{{ base_domain }}"
+monitor_domain:      "monitor.{{ base_domain }}"
+prometheus_domain:   "prometheus.{{ base_domain }}"
+alertmanager_domain: "alertmanager.{{ base_domain }}"
+minio_s3_domain:     "s3.{{ base_domain }}"
+minio_console_domain: "s3console.{{ base_domain }}"
+opensearch_domain:   "opensearch.{{ base_domain }}"
+dashboard_domain:    "dashboard.{{ base_domain }}"
+postgres_rw_domain:  "postgres-rw.{{ base_domain }}"
+postgres_ro_domain:  "postgres-ro.{{ base_domain }}"
+redis_domain:        "redis.{{ base_domain }}"
+
+# -----------------------------------------------------------------------------
+# [3] 인증서 파일 (플레이북 루트 폴더에 아래 파일명으로 위치)
+#   외부 인증서:  ca.crt / tls.crt / tls.key  를 루트에 복사해두면 자동 사용
+#   자체 서명:    00_gen_cert.sh 실행 후 동일한 파일명으로 생성됨
+# -----------------------------------------------------------------------------
+cert_dir:   "{{ playbook_dir }}"   # 인증서 파일 위치 (루트 폴더)
+ca_cert:    "{{ cert_dir }}/ca.crt"
+tls_cert:   "{{ cert_dir }}/tls.crt"
+tls_key:    "{{ cert_dir }}/tls.key"
+
+# K8s 와일드카드 TLS Secret 이름 (19_ssl_setup.yml 에서 생성)
+wildcard_secret: "wildcard-tls"
+
+# -----------------------------------------------------------------------------
+# [4] Harbor 설정
+# -----------------------------------------------------------------------------
+harbor_admin_password: "Harbor12345"    # ★ 변경 권장 ★
+harbor_project:        "miso"           # Harbor 프로젝트명 (이미지 경로에 사용)
+harbor_registry:       "{{ harbor_domain }}"
+
+# Harbor 이미지 경로 prefix (harbor_registry/harbor_project)
+image_prefix: "{{ harbor_registry }}/{{ harbor_project }}"
+
+harbor_cert_dir: "/etc/harbor/certs"
+harbor_cert_src: "{{ tls_cert }}"
+harbor_key_src:  "{{ tls_key }}"
+
+# -----------------------------------------------------------------------------
+# [5] K8s imagePullSecret
+# -----------------------------------------------------------------------------
+image_pull_secret: "harbor-registry-secret"
+
+# -----------------------------------------------------------------------------
+# [6] 데이터베이스 (CNPG PostgreSQL)
+# -----------------------------------------------------------------------------
+pg_cluster_name: "miso-db"
+pg_db_name:      "miso"
+pg_db_owner:     "miso_admin"
+
+# -----------------------------------------------------------------------------
+# [7] Redis
+# -----------------------------------------------------------------------------
+redis_name:          "miso-redis"
+redis_sentinel_name: "miso-redis-master"
+
+# -----------------------------------------------------------------------------
+# [8] MinIO
+# -----------------------------------------------------------------------------
+minio_root_user:     "misoadmin"
+minio_root_password: "misopassword"   # ★ 변경 권장 ★
+
+# -----------------------------------------------------------------------------
+# [9] OpenSearch
+# -----------------------------------------------------------------------------
+os_name:      "opensearch"
+os_namespace: "default"
+
+# -----------------------------------------------------------------------------
+# [10] 공통 시스템
+# -----------------------------------------------------------------------------
+timezone: "Asia/Seoul"
+k8s_version: "1.30"
+pod_cidr:    "10.244.0.0/16"
+api_endpoint: "{{ hostvars[groups['lb'][0]]['ansible_host'] }}"

@@ -9,7 +9,7 @@
 #     없으면 자동 다운로드
 #
 # 포트:
-#   - 443 : Harbor HTTPS (harbor.miso.local)
+#   - 443 : Harbor HTTPS ({{ harbor_domain }})
 #   - 80  : HTTP → HTTPS redirect
 # =================================================================
 
@@ -20,12 +20,12 @@
     harbor_version: "v2.10.2"
     harbor_install_dir: "/opt/harbor"
     harbor_data_dir: "/data/harbor"
-    harbor_hostname: "harbor.miso.local"
+    harbor_hostname: "{{ harbor_domain }}"
     harbor_admin_password: "Harbor12345"     # 변경 권장
 
     harbor_cert_dir: "/etc/harbor/certs"
-    harbor_cert_src: "./tls.crt"
-    harbor_key_src:  "./tls.key"
+    harbor_cert_src: "{{ tls_cert }}"
+    harbor_key_src:  "{{ tls_key }}"
 
   tasks:
     # ---------------------------------------------------------------
@@ -263,18 +263,18 @@
   tasks:
     - name: "containerd certs.d 디렉토리 생성"
       ansible.builtin.file:
-        path: /etc/containerd/certs.d/harbor.miso.local
+        path: /etc/containerd/certs.d/{{ harbor_domain }}
         state: directory
         mode: "0755"
 
     - name: "containerd에 Harbor 인증서 등록"
       ansible.builtin.copy:
-        dest: /etc/containerd/certs.d/harbor.miso.local/hosts.toml
+        dest: /etc/containerd/certs.d/{{ harbor_domain }}/hosts.toml
         mode: "0644"
         content: |
-          server = "https://harbor.miso.local"
+          server = "https://{{ harbor_domain }}"
 
-          [host."https://harbor.miso.local"]
+          [host."https://{{ harbor_domain }}"]
             ca = "/usr/local/share/ca-certificates/harbor.crt"
       notify: Restart containerd
 
@@ -285,19 +285,19 @@
         state: restarted
 
 # ---------------------------------------------------------------
-# CoreDNS에 harbor.miso.local 등록
+# CoreDNS에 {{ harbor_domain }} 등록
 # ---------------------------------------------------------------
-- name: "CoreDNS harbor.miso.local 등록"
+- name: "CoreDNS {{ harbor_domain }} 등록"
   hosts: bastion
   become: no
   gather_facts: false
   environment:
     KUBECONFIG: "{{ lookup('env', 'HOME') }}/.kube/config"
   tasks:
-    - name: "harbor.miso.local 이미 등록됐는지 확인"
+    - name: "{{ harbor_domain }} 이미 등록됐는지 확인"
       ansible.builtin.shell: |
         kubectl get configmap coredns -n kube-system \
-          -o jsonpath='{.data.Corefile}' | grep -c "harbor.miso.local" || true
+          -o jsonpath='{.data.Corefile}' | grep -c "{{ harbor_domain }}" || true
       register: harbor_dns_check
       changed_when: false
 
@@ -308,7 +308,7 @@
         import json, sys
         cm = json.load(sys.stdin)
         corefile = cm['data']['Corefile']
-        entry = '    hosts {\n      10.1.5.10 harbor.miso.local\n      fallthrough\n    }\n'
+        entry = '    hosts {\n      10.1.5.10 {{ harbor_domain }}\n      fallthrough\n    }\n'
         corefile = corefile.replace('    ready\n', '    ready\n' + entry, 1)
         cm['data']['Corefile'] = corefile
         print(json.dumps(cm))
@@ -323,9 +323,9 @@
       when: dns_update is changed
       changed_when: true
 
-    - name: "harbor.miso.local DNS 확인"
+    - name: "{{ harbor_domain }} DNS 확인"
       ansible.builtin.shell: |
-        nslookup harbor.miso.local 2>/dev/null || true
+        nslookup {{ harbor_domain }} 2>/dev/null || true
       register: dns_check
       changed_when: false
       failed_when: false
@@ -348,9 +348,9 @@
           - "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
           - " Harbor 구성 완료"
           - "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-          - " UI      : https://harbor.miso.local"
+          - " UI      : https://{{ harbor_domain }}"
           - " Admin   : admin / Harbor12345  ← 변경 권장"
           - " 프로젝트: miso (private)"
           - ""
-          - " docker login harbor.miso.local"
+          - " docker login {{ harbor_domain }}"
           - "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"

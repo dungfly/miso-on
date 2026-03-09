@@ -6,16 +6,16 @@
 #
 # 사전 준비 (작업 PC에서 1회):
 #   bash 00_gen_certs.sh
-#   → ca.crt, tls.crt, tls.key, harbor.miso.local.crt/key 생성
+#   → ca.crt, tls.crt, tls.key, {{ harbor_domain }}.crt/key 생성
 #   → 베스천 플레이북 디렉토리에 복사
 #
 # 적용 서비스:
-#   - monitor.miso.local      (Grafana     - Docker, nginx reverse proxy)
-#   - prometheus.miso.local  (Prometheus  - Docker, nginx reverse proxy)
-#   - alertmanager.miso.local (AlertManager - Docker, nginx reverse proxy)
-#   - argocd.miso.local   (ArgoCD  - K8s Ingress)
-#   - harbor.miso.local   (Harbor  - Docker, 인증서 교체)
-#   - dashboard.miso.local (OpenSearch Dashboards - K8s Ingress)
+#   - {{ monitor_domain }}      (Grafana     - Docker, nginx reverse proxy)
+#   - {{ prometheus_domain }}  (Prometheus  - Docker, nginx reverse proxy)
+#   - {{ alertmanager_domain }} (AlertManager - Docker, nginx reverse proxy)
+#   - {{ argocd_domain }}   (ArgoCD  - K8s Ingress)
+#   - {{ harbor_domain }}   (Harbor  - Docker, 인증서 교체)
+#   - {{ dashboard_domain }} (OpenSearch Dashboards - K8s Ingress)
 # =================================================================
 
 - name: "SSL 인증서 적용"
@@ -26,20 +26,16 @@
     KUBECONFIG: "{{ lookup('env', 'HOME') }}/.kube/config"
   vars:
     cert_dir: "{{ playbook_dir }}"
-    ca_cert:   "{{ playbook_dir }}/ca.crt"
-    tls_cert:  "{{ playbook_dir }}/tls.crt"
-    tls_key:   "{{ playbook_dir }}/tls.key"
 
     # K8s wildcard secret 이름 (전 네임스페이스 공통)
-    wildcard_secret: "miso-wildcard-tls"
 
     # 서비스별 설정
     argocd_namespace: "argocd"
-    argocd_hostname:  "argocd.miso.local"
+    argocd_hostname:  "{{ argocd_domain }}"
 
     os_namespace: "default"
     os_name:      "miso-opensearch"
-    os_dashboard_hostname: "dashboard.miso.local"
+    os_dashboard_hostname: "{{ dashboard_domain }}"
 
   tasks:
     # ---------------------------------------------------------------
@@ -158,26 +154,26 @@
       changed_when: "'created' in os_ingress.stdout or 'configured' in os_ingress.stdout"
 
     # ---------------------------------------------------------------
-    # STEP 4. CoreDNS에 dashboard.miso.local 등록
+    # STEP 4. CoreDNS에 {{ dashboard_domain }} 등록
     # ---------------------------------------------------------------
-    - name: "4-a. dashboard.miso.local 등록 여부 확인"
+    - name: "4-a. {{ dashboard_domain }} 등록 여부 확인"
       ansible.builtin.shell: |
         kubectl get configmap coredns -n kube-system \
-          -o jsonpath='{.data.Corefile}' | grep -c "dashboard.miso.local" || true
+          -o jsonpath='{.data.Corefile}' | grep -c "{{ dashboard_domain }}" || true
       register: dashboard_dns_check
       changed_when: false
 
-    - name: "4-b. CoreDNS에 dashboard.miso.local 추가"
+    - name: "4-b. CoreDNS에 {{ dashboard_domain }} 추가"
       ansible.builtin.shell: |
         kubectl get configmap coredns -n kube-system -o json | \
         python3 -c "
         import json, sys
         cm = json.load(sys.stdin)
         corefile = cm['data']['Corefile']
-        entry = '      10.1.1.10 dashboard.miso.local\n'
+        entry = '      {{ hostvars[groups["lb"][0]]["ansible_host"] }} {{ dashboard_domain }}\n'
         corefile = corefile.replace(
-          '10.1.1.10 argocd.miso.local\n',
-          '10.1.1.10 argocd.miso.local\n' + entry
+          '{{ hostvars[groups["lb"][0]]["ansible_host"] }} {{ argocd_domain }}\n',
+          '{{ hostvars[groups["lb"][0]]["ansible_host"] }} {{ argocd_domain }}\n' + entry
         )
         cm['data']['Corefile'] = corefile
         print(json.dumps(cm))
@@ -230,7 +226,7 @@
 
     - name: "6-b. Harbor 기동 대기"
       ansible.builtin.uri:
-        url: "https://harbor.miso.local/api/v2.0/health"
+        url: "https://{{ harbor_domain }}/api/v2.0/health"
         validate_certs: no
         status_code: 200
       register: harbor_health
@@ -283,14 +279,14 @@
           # HTTP → HTTPS redirect
           server {
               listen 80;
-              server_name monitor.miso.local;
+              server_name {{ monitor_domain }};
               return 301 https://$host$request_uri;
           }
 
           # HTTPS reverse proxy → Grafana (localhost:3000)
           server {
               listen 443 ssl;
-              server_name monitor.miso.local;
+              server_name {{ monitor_domain }};
 
               ssl_certificate     /etc/nginx/certs/tls.crt;
               ssl_certificate_key /etc/nginx/certs/tls.key;
@@ -309,14 +305,14 @@
           # HTTP → HTTPS redirect (prometheus)
           server {
               listen 80;
-              server_name prometheus.miso.local;
+              server_name {{ prometheus_domain }};
               return 301 https://$host$request_uri;
           }
 
           # HTTPS reverse proxy → Prometheus (localhost:9090)
           server {
               listen 443 ssl;
-              server_name prometheus.miso.local;
+              server_name {{ prometheus_domain }};
 
               ssl_certificate     /etc/nginx/certs/tls.crt;
               ssl_certificate_key /etc/nginx/certs/tls.key;
@@ -335,14 +331,14 @@
           # HTTP → HTTPS redirect (alertmanager)
           server {
               listen 80;
-              server_name alertmanager.miso.local;
+              server_name {{ alertmanager_domain }};
               return 301 https://$host$request_uri;
           }
 
           # HTTPS reverse proxy → AlertManager (localhost:9093)
           server {
               listen 443 ssl;
-              server_name alertmanager.miso.local;
+              server_name {{ alertmanager_domain }};
 
               ssl_certificate     /etc/nginx/certs/tls.crt;
               ssl_certificate_key /etc/nginx/certs/tls.key;
@@ -393,12 +389,12 @@
           - "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
           - " SSL 적용 완료"
           - "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-          - " https://harbor.miso.local      (Harbor)"
-          - " https://argocd.miso.local      (ArgoCD)"
-          - " https://monitor.miso.local        (Grafana)"
-          - " https://prometheus.miso.local     (Prometheus)"
-          - " https://alertmanager.miso.local   (AlertManager)"
-          - " https://dashboard.miso.local   (OpenSearch Dashboards)"
+          - " https://{{ harbor_domain }}      (Harbor)"
+          - " https://{{ argocd_domain }}      (ArgoCD)"
+          - " https://{{ monitor_domain }}        (Grafana)"
+          - " https://{{ prometheus_domain }}     (Prometheus)"
+          - " https://{{ alertmanager_domain }}   (AlertManager)"
+          - " https://{{ dashboard_domain }}   (OpenSearch Dashboards)"
           - ""
           - " ※ 접속 PC에 CA 인증서(ca.crt) 설치 필요"
           - "   Windows: 00_install_ca_windows.bat (관리자 권한)"
@@ -425,9 +421,8 @@
   environment:
     KUBECONFIG: "{{ lookup('env', 'HOME') }}/.kube/config"
   vars:
-    wildcard_secret: "miso-wildcard-tls"
     minio_namespace: "default"
-    minio_console_host: "s3console.miso.local"
+    minio_console_host: "{{ minio_console_domain }}"
     minio_console_allowed_cidrs: "0.0.0.0/0"
 
   tasks:

@@ -17,12 +17,14 @@
 set -euo pipefail
 export DEBIAN_FRONTEND=noninteractive
 
-HARBOR_VERSION="v2.10.2"
-HARBOR_INSTALL_DIR="/opt/harbor"
-HARBOR_DATA_DIR="/data/harbor"
-HARBOR_HOSTNAME="harbor.miso.local"
-HARBOR_ADMIN_PASSWORD="Harbor12345"
-HARBOR_CERT_DIR="/etc/harbor/certs"
+# ★ 도메인/패스워드 변경 시 여기만 수정하세요
+#   또는 환경변수로 주입: HARBOR_HOSTNAME=harbor.example.com bash A1_harbor_install.sh
+HARBOR_VERSION="${HARBOR_VERSION:-v2.10.2}"
+HARBOR_INSTALL_DIR="${HARBOR_INSTALL_DIR:-/opt/harbor}"
+HARBOR_DATA_DIR="${HARBOR_DATA_DIR:-/data/harbor}"
+HARBOR_HOSTNAME="${HARBOR_HOSTNAME:-harbor.miso.local}"     # ★ 실제 도메인으로 변경
+HARBOR_ADMIN_PASSWORD="${HARBOR_ADMIN_PASSWORD:-Harbor12345}"  # ★ 변경 권장
+HARBOR_CERT_DIR="${HARBOR_CERT_DIR:-/etc/harbor/certs}"
 HARBOR_IP=$(hostname -I | awk '{print $1}')
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -37,10 +39,10 @@ echo "━━━━━━━━━━━━━━━━━━━━━━━━�
 # =================================================================
 echo ""
 echo ">>> [0] /etc/hosts 등록"
-if ! grep -q "harbor.miso.local" /etc/hosts; then
-  echo "${HARBOR_IP} harbor.miso.local" | sudo tee -a /etc/hosts
+if ! grep -q "${HARBOR_HOSTNAME}" /etc/hosts; then
+  echo "${HARBOR_IP} ${HARBOR_HOSTNAME}" | sudo tee -a /etc/hosts
 fi
-echo "  ✓ ${HARBOR_IP} harbor.miso.local"
+echo "  ✓ ${HARBOR_IP} ${HARBOR_HOSTNAME}"
 
 # =================================================================
 # STEP 1. 기본 패키지 + nginx 설치
@@ -116,7 +118,7 @@ else
   sudo openssl req -x509 -nodes -days 3650 -newkey rsa:4096 \
     -keyout "${HARBOR_CERT_DIR}/harbor.key" \
     -out    "${HARBOR_CERT_DIR}/harbor.crt" \
-    -subj "/CN=${HARBOR_HOSTNAME}/O=miso" \
+    -subj "/CN=${HARBOR_HOSTNAME}" \
     -addext "subjectAltName=DNS:${HARBOR_HOSTNAME},IP:${HARBOR_IP}"
 fi
 
@@ -229,7 +231,7 @@ echo ""
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 echo " Harbor 설치 완료"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-echo " UI      : https://harbor.miso.local"
+echo " UI      : https://${HARBOR_HOSTNAME}"
 echo " Admin   : admin / ${HARBOR_ADMIN_PASSWORD}"
 echo " 프로젝트: miso (private)"
 echo ""

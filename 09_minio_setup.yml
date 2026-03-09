@@ -6,13 +6,13 @@
 #
 # 변경 이력:
 #   - 자격증명을 vars 하드코딩 → K8s Secret으로 분리
-#   - console.miso.local → s3console.miso.local
+#   - console.miso.local → {{ minio_console_domain }}
 #   - hosts: all → bastion/workers 플레이 분리
 #   - 기존 리소스 삭제 후 재설치 지원 (PVC 보존)
 #
 # 선행 조건:
 #   - 08_k8s_storage.yml (local-path provisioner)
-#   - 08_5_coredns_setup.yml (s3.miso.local DNS)
+#   - 08_5_coredns_setup.yml ({{ minio_s3_domain }} DNS)
 #   - 06_k8s_ingress.yml (Nginx Ingress)
 #   - 07_cert_setup.yml (cert-manager, internal-ca-issuer)
 #
@@ -61,12 +61,11 @@
   vars:
     minio_namespace: "default"
     minio_replicas: 3
-    minio_image: "harbor.miso.local/miso/minio:latest"
-    # minio_image: "quay.io/minio/minio:latest"
+    minio_image: "{{ image_prefix }}/minio:latest"
     minio_storageclass: "local-path"
     minio_storage_size: "20Gi"
-    minio_s3_host: "s3.miso.local"         # 내부 DNS rewrite 전용 (Ingress 없음)
-    minio_console_host: "s3console.miso.local"  # Console 외부 접속용 (Ingress)
+    minio_s3_host: "{{ minio_s3_domain }}"         # 내부 DNS rewrite 전용 (Ingress 없음)
+    minio_console_host: "{{ minio_console_domain }}"  # Console 외부 접속용 (Ingress)
     minio_secret_name: "minio-credentials"
 
     # Console 접속 방식 선택
@@ -81,8 +80,8 @@
 
     # 자격증명 (Secret으로 분리 - 플레이북에는 초기값만)
     # 운영 환경에서는 Ansible Vault 또는 외부 Secret Manager 사용 권장
-    minio_root_user: "misoadmin"
-    minio_root_password: "misopassword"
+    minio_root_user: "{{ minio_root_user }}"
+    minio_root_password: "{{ minio_root_password }}"
 
   tasks:
     # -----------------------------------------------------------------
@@ -283,7 +282,7 @@
           # ============================================================
           # 4. Ingress (Console 전용 외부 접속)
           #   console_access_mode=ingress 일 때만 생성
-          #   s3console.miso.local → HAProxy → Nginx Ingress → MinIO Console
+          #   {{ minio_console_domain }} → HAProxy → Nginx Ingress → MinIO Console
           #   IP 화이트리스트로 접근 제한
           # ============================================================
           apiVersion: networking.k8s.io/v1
@@ -294,14 +293,14 @@
             annotations:
               kubernetes.io/ingress.class: nginx
               nginx.ingress.kubernetes.io/proxy-body-size: "0"
-              cert-manager.io/cluster-issuer: "internal-ca-issuer"
+              cert-manager.io/cluster-issuer: "internal-ca-issuer"  # 외부 인증서 사용시 이 줄 삭제
               nginx.ingress.kubernetes.io/force-ssl-redirect: "true"
               nginx.ingress.kubernetes.io/whitelist-source-range: "{{ minio_console_allowed_cidrs }}"
           spec:
             tls:
             - hosts:
               - {{ minio_console_host }}
-              secretName: minio-console-tls-secret
+              secretName: "{{ wildcard_secret }}"
             rules:
             - host: {{ minio_console_host }}
               http:
@@ -396,11 +395,11 @@
           - "  kubectl get secret {{ minio_secret_name }} -o yaml"
           - ""
           - " 내부 접속 (앱에서):"
-          - "  S3 API : http://s3.miso.local:9000  (CoreDNS rewrite)"
+          - "  S3 API : http://{{ minio_s3_domain }}:9000  (CoreDNS rewrite)"
           - "  또는   : http://minio-internal:9000  (ClusterIP)"
           - ""
           - " 외부 접속 (브라우저):"
-          - "  {{ 'Console: https://s3console.miso.local  (Ingress - IP 화이트리스트 적용)' if console_access_mode == 'ingress' else 'Console: SSH 터널 모드 (91_tunnel_setting.yml 사용)' }}"
+          - "  {{ 'Console: https://{{ minio_console_domain }}  (Ingress - IP 화이트리스트 적용)' if console_access_mode == 'ingress' else 'Console: SSH 터널 모드 (91_tunnel_setting.yml 사용)' }}"
           - "  {{ '접근 허용 IP: ' + minio_console_allowed_cidrs if console_access_mode == 'ingress' else '  bastion: sudo systemctl start tunnel-minio' }}"
           - ""
           - " 자격증명 확인:"

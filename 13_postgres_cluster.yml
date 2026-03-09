@@ -5,17 +5,17 @@
   environment:
     KUBECONFIG: "{{ lookup('env', 'HOME') }}/.kube/config"
   vars:
-    cluster_name: "miso-db"
+    cluster_name: "{{ pg_cluster_name }}"
     storage_class: "local-path"
     storage_size: "30Gi"          # 최초 설치 시 신중히 결정 (변경 불가)
 
-    db_name: "miso"
-    db_owner: "miso_admin"
+    db_name: "{{ pg_db_name }}"
+    db_owner: "{{ pg_db_owner }}"
 
     pg_action: "install"          # install / remove (PVC 보존) / purge (완전 삭제)
 
     # CNPG 기본 이미지 (pgvector/uuid-ossp 포함 확인됨)
-    postgres_image: "harbor.miso.local/miso/postgres:16"
+    postgres_image: "{{ image_prefix }}/postgres:16"
 
     # Pod CIDR (03_k8s_masters.yml 의 pod_cidr 과 일치시킬 것)
     pod_cidr: "10.244.0.0/16"
@@ -218,8 +218,8 @@
           - "  Extensions: vector, uuid-ossp"
           - ""
           - " [내부 접속 (앱에서)]"
-          - "  RW : postgres-rw.miso.local:5432"
-          - "  RO : postgres-ro.miso.local:5432"
+          - "  RW : {{ postgres_rw_domain }}:5432"
+          - "  RO : {{ postgres_ro_domain }}:5432"
           - "  또는: {{ cluster_name }}-rw:5432 / {{ cluster_name }}-ro:5432"
           - ""
           - " [자격증명 확인]"
