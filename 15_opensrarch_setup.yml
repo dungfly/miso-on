@@ -40,8 +40,8 @@
     os_action: "install"          # install / remove (PVC 보존) / purge (완전 삭제)
 
     # 이미지
-    os_image: "harbor.miso.local/miso/opensearch:2.19.1"
-    os_dashboard_image: "harbor.miso.local/miso/opensearch-dashboards:2.19.1"
+    os_image: "{{ image_prefix }}/opensearch:2.19.1"
+    os_dashboard_image: "{{ image_prefix }}/opensearch-dashboards:2.19.1"
 
     # 클러스터 설정
     os_replicas: 3
@@ -57,7 +57,7 @@
     os_storageclass: "local-path"
 
     # 자격증명
-    os_admin_password: "MisoAdmin1!"
+    os_admin_password: "{{ opensearch_admin_password }}"
 
     # cert-manager 설정
     cert_issuer: "internal-ca-issuer"
@@ -203,7 +203,7 @@
             renewBefore: 720h
             commonName: {{ os_name }}
             dnsNames:
-              - opensearch.miso.local
+              - {{ opensearch_domain }}
               - {{ os_name }}.{{ os_namespace }}.svc.cluster.local
               - {{ os_name }}-headless.{{ os_namespace }}.svc.cluster.local
               - localhost
@@ -465,7 +465,7 @@
                         readOnly: true
 
                   - name: sysctl
-                    image: harbor.miso.local/miso/busybox:1.36
+                    image: {{ image_prefix }}/busybox:1.36
                     securityContext:
                       privileged: true
                     command: ["sh", "-c", "sysctl -w vm.max_map_count=262144"]
@@ -675,7 +675,7 @@
     # -----------------------------------------------------------------
     # STEP 8. CoreDNS rewrite 추가
     # -----------------------------------------------------------------
-    - name: "8. CoreDNS opensearch.miso.local 등록 여부 확인"
+    - name: "8. CoreDNS {{ opensearch_domain }} 등록 여부 확인"
       ansible.builtin.shell: |
         kubectl get configmap coredns -n kube-system \
           -o jsonpath='{.data.Corefile}' | grep -q 'opensearch\.miso\.local'
@@ -695,16 +695,16 @@
         corefile = cm["data"]["Corefile"]
 
         new_rules = (
-            "      rewrite name exact opensearch.miso.local "
+            "      rewrite name exact {{ opensearch_domain }} "
             "miso-opensearch.default.svc.cluster.local\n"
-            "      rewrite name exact dashboard.miso.local "
+            "      rewrite name exact {{ dashboard_domain }} "
             "miso-opensearch-dashboards.default.svc.cluster.local\n"
         )
 
         lines = corefile.splitlines(True)
         insert_at = None
         for i, l in enumerate(lines):
-            if "rewrite name exact" in l and "miso.local" in l:
+            if "rewrite name exact" in l and base_domain in l:
                 insert_at = i + 1
 
         if insert_at is None:
@@ -740,7 +740,7 @@
 
     - name: "8. DNS 결과"
       ansible.builtin.debug:
-        msg: "{{ 'opensearch.miso.local 이미 등록됨 - 스킵' if os_dns_exists.rc == 0 else 'opensearch.miso.local + dashboard.miso.local 등록 완료' }}"
+        msg: "{{ '{{ opensearch_domain }} 이미 등록됨 - 스킵' if os_dns_exists.rc == 0 else '{{ opensearch_domain }} + {{ dashboard_domain }} 등록 완료' }}"
 
     # -----------------------------------------------------------------
     # STEP 9. 클러스터 상태 검증
@@ -778,7 +778,7 @@
         echo
         echo "=== CoreDNS rewrite ==="
         kubectl get configmap coredns -n kube-system \
-          -o jsonpath='{.data.Corefile}' | grep "miso.local"
+          -o jsonpath='{.data.Corefile}' | grep "{{ base_domain }}"
       register: final_status
       changed_when: false
 
@@ -806,12 +806,12 @@
           - "  Storage: {{ os_storage_size }} / SSL: cert-manager (internal-ca-issuer)"
           - ""
           - " [내부 접속 (앱에서)]"
-          - "  HTTPS : https://opensearch.miso.local:9200  (CoreDNS rewrite)"
+          - "  HTTPS : https://{{ opensearch_domain }}:9200  (CoreDNS rewrite)"
           - "  또는  : https://{{ os_name }}:9200"
           - "  ※ 내부 CA 인증서이므로 verify=False 또는 CA 번들 설정 필요"
           - ""
           - " [Dashboards]"
-          - "  내부  : http://dashboard.miso.local:5601"
+          - "  내부  : http://{{ dashboard_domain }}:5601"
           - "  터널  : ssh -L 5601:localhost:5601 -i <key.pem> ubuntu@<bastion-IP> -N"
           - "  브라우저: http://localhost:5601"
           - ""

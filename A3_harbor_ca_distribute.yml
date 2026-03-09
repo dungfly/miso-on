@@ -187,7 +187,7 @@
     KUBECONFIG: "{{ lookup('env', 'HOME') }}/.kube/config"
   vars:
     harbor_user: "admin"
-    harbor_password: "Harbor12345"
+    harbor_password: "{{ harbor_admin_password }}"
     harbor_server: "{{ harbor_domain }}"
   tasks:
     - name: "harbor-registry-secret 존재 여부 확인"

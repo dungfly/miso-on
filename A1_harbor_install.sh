@@ -139,6 +139,13 @@ echo ">>> [3] Harbor 설치"
 
 sudo mkdir -p "${HARBOR_INSTALL_DIR}" "${HARBOR_DATA_DIR}"
 
+# Harbor 각 서비스 데이터 디렉토리 사전 생성 및 권한 설정
+# Redis 컨테이너 UID=999, registry/postgresql UID=10000
+sudo mkdir -p "${HARBOR_DATA_DIR}"/{redis,registry,database,job_logs,trivy-adapter,secret}
+sudo chown -R 999:999     "${HARBOR_DATA_DIR}/redis"
+sudo chown -R 10000:10000 "${HARBOR_DATA_DIR}/registry"
+sudo chmod 755 "${HARBOR_DATA_DIR}/redis" "${HARBOR_DATA_DIR}/registry"
+
 INSTALLER_TGZ="${SCRIPT_DIR}/harbor-offline-installer-${HARBOR_VERSION}.tgz"
 INSTALLER_DEST="${HOME}/harbor-offline-installer-${HARBOR_VERSION}.tgz"
 

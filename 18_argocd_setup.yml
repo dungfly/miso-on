@@ -22,12 +22,12 @@
   vars:
     argocd_action: "install"
     argocd_namespace: "argocd"
-    argocd_hostname: "argocd.miso.local"
+    argocd_hostname: "{{ argocd_domain }}"
 
-    harbor_hostname: "harbor.miso.local"
+    harbor_hostname: "{{ harbor_domain }}"
     harbor_project: "miso"
     harbor_admin_user: "admin"
-    harbor_admin_password: "Harbor12345"
+    harbor_admin_password: "{{ harbor_admin_password }}"
 
     argocd_manifest: "http://{{ hostvars[groups['harbor'][0]]['ansible_host'] }}:8080/manifests/argocd-install.yaml"
     image_updater_manifest: "http://{{ hostvars[groups['harbor'][0]]['ansible_host'] }}:8080/manifests/argocd-image-updater.yaml"
@@ -102,7 +102,7 @@
       changed_when: false
 
     # ---------------------------------------------------------------
-    # STEP 2. Ingress 설정 (argocd.miso.local)
+    # STEP 2. Ingress 설정 ({{ argocd_domain }})
     # ---------------------------------------------------------------
     - name: "2. ArgoCD Ingress 생성"
       ansible.builtin.shell: |
@@ -133,12 +133,12 @@
       changed_when: "'created' in ingress_result.stdout or 'configured' in ingress_result.stdout"
 
     # ---------------------------------------------------------------
-    # STEP 3. CoreDNS에 argocd.miso.local 등록
+    # STEP 3. CoreDNS에 {{ argocd_domain }} 등록
     # ---------------------------------------------------------------
-    - name: "3-a. argocd.miso.local 이미 등록됐는지 확인"
+    - name: "3-a. {{ argocd_domain }} 이미 등록됐는지 확인"
       ansible.builtin.shell: |
         kubectl get configmap coredns -n kube-system \
-          -o jsonpath='{.data.Corefile}' | grep -c "argocd.miso.local" || true
+          -o jsonpath='{.data.Corefile}' | grep -c "{{ argocd_domain }}" || true
       register: argocd_dns_check
       changed_when: false
 
@@ -149,10 +149,10 @@
         import json, sys
         cm = json.load(sys.stdin)
         corefile = cm['data']['Corefile']
-        entry = '      10.1.1.10 argocd.miso.local\n'
+        entry = '      10.1.1.10 {{ argocd_domain }}\n'
         corefile = corefile.replace(
-          '{{ hostvars[groups["harbor"][0]]["ansible_host"] }} harbor.miso.local\n',
-          '{{ hostvars[groups["harbor"][0]]["ansible_host"] }} harbor.miso.local\n' + entry
+          '{{ hostvars[groups["harbor"][0]]["ansible_host"] }} {{ harbor_domain }}\n',
+          '{{ hostvars[groups["harbor"][0]]["ansible_host"] }} {{ harbor_domain }}\n' + entry
         )
         cm['data']['Corefile'] = corefile
         print(json.dumps(cm))
@@ -268,7 +268,7 @@
           - "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
           - " ArgoCD 구성 완료"
           - "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-          - " UI            : https://argocd.miso.local"
+          - " UI            : https://{{ argocd_domain }}"
           - " 초기 admin PW : {{ argocd_password.stdout | default('조회 실패') }}"
           - " Harbor        : {{ harbor_hostname }}/{{ harbor_project }}"
           - " Image Updater : 설치 완료 (Harbor push 감지)"

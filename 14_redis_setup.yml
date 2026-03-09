@@ -39,11 +39,11 @@
 
   vars:
     redis_namespace: "default"
-    redis_name: "miso-redis"
+    redis_name: "{{ redis_name }}"
     redis_action: "install"       # install / remove (PVC 보존) / purge (완전 삭제)
 
     # 이미지
-    redis_image: "harbor.miso.local/miso/redis:7.4.3-alpine"
+    redis_image: "{{ image_prefix }}/redis:7.4.3-alpine"
 
     # 메모리 설정 (POC: 4gb, 운영: 8gb)
     redis_maxmemory: "4gb"
@@ -54,14 +54,14 @@
     sentinel_quorum: 2
     sentinel_down_after: 5000
     sentinel_failover_timeout: 60000
-    sentinel_master_name: "miso-redis-master"
+    sentinel_master_name: "{{ redis_sentinel_name }}"
 
     # Persistence
     redis_storage_size: "20Gi"
     redis_storageclass: "local-path"
 
     # 자격증명
-    redis_password: "misoredis"
+    redis_password: "{{ redis_password }}"
 
     # db_nodes 배치 (Redis Data 전용)
     db_node_label_key: "node-role.kubernetes.io/db"
@@ -522,7 +522,7 @@
     # -----------------------------------------------------------------
     # STEP 7. CoreDNS rewrite 추가
     # -----------------------------------------------------------------
-    - name: "7. CoreDNS redis.miso.local 등록 여부 확인"
+    - name: "7. CoreDNS {{ redis_domain }} 등록 여부 확인"
       ansible.builtin.shell: |
         kubectl get configmap coredns -n kube-system \
           -o jsonpath='{.data.Corefile}' | grep -q 'redis\.miso\.local'
@@ -530,7 +530,7 @@
       changed_when: false
       failed_when: false
 
-    - name: "7. CoreDNS redis.miso.local rewrite 추가"
+    - name: "7. CoreDNS {{ redis_domain }} rewrite 추가"
       ansible.builtin.shell: |
         python3 - <<'PY'
         import subprocess, json, sys
@@ -542,14 +542,14 @@
         corefile = cm["data"]["Corefile"]
 
         new_rules = (
-            "      rewrite name exact redis.miso.local "
-            "miso-redis-sentinel.default.svc.cluster.local\n"
+            "      rewrite name exact {{ redis_domain }} "
+            "{{ redis_name }}-sentinel.default.svc.cluster.local\n"
         )
 
         lines = corefile.splitlines(True)
         insert_at = None
         for i, l in enumerate(lines):
-            if "rewrite name exact" in l and "miso.local" in l:
+            if "rewrite name exact" in l and base_domain in l:
                 insert_at = i + 1
 
         if insert_at is None:
@@ -585,7 +585,7 @@
 
     - name: "7. DNS 결과"
       ansible.builtin.debug:
-        msg: "{{ 'redis.miso.local 이미 등록됨 - 스킵' if redis_dns_exists.rc == 0 else 'redis.miso.local 등록 완료' }}"
+        msg: "{{ '{{ redis_domain }} 이미 등록됨 - 스킵' if redis_dns_exists.rc == 0 else '{{ redis_domain }} 등록 완료' }}"
 
     # -----------------------------------------------------------------
     # STEP 8. 접속 검증
@@ -618,7 +618,7 @@
         echo
         echo "=== CoreDNS rewrite ==="
         kubectl get configmap coredns -n kube-system \
-          -o jsonpath='{.data.Corefile}' | grep "miso.local"
+          -o jsonpath='{.data.Corefile}' | grep "{{ base_domain }}"
       register: final_status
       changed_when: false
 
@@ -648,7 +648,7 @@
           - "  메모리  : {{ redis_maxmemory }} / Persistence: RDB + AOF"
           - ""
           - " [내부 접속 (앱에서)]"
-          - "  Sentinel: redis.miso.local:26379  (CoreDNS rewrite)"
+          - "  Sentinel: {{ redis_domain }}:26379  (CoreDNS rewrite)"
           - "  또는    : {{ redis_name }}-sentinel:26379"
           - "  Master  : {{ redis_name }}-0.{{ redis_name }}-headless:6379"
           - ""

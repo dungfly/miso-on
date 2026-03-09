@@ -24,7 +24,7 @@
     monitoring_base_dir: "/opt/monitoring"
     monitoring_data_dir: "/data/monitoring"
 
-    grafana_admin_password: "misomonitor"  # 변경 권장
+    grafana_admin_password: "{{ grafana_admin_password }}"
     grafana_hostname: "{{ monitor_domain }}"
 
     # 수집 대상 K8s 노드 목록 (hosts.ini 기반 자동 생성)
@@ -465,7 +465,7 @@
           - " AlertManager : https://{{ alertmanager_domain }} (19_ssl_setup 실행 후)"
           - " Loki         : http://10.1.5.100:3100          (내부 전용 - 직접 접속 불필요)"
           - ""
-          - " Grafana 계정 : admin / misomonitor  ← 변경 권장"
+          - " Grafana 계정 : admin / {{ grafana_admin_password }}"
           - " 로그 보존    : 7일"
           - ""
           - " 재설치: ansible-playbook -i hosts.ini 17_monitoring_setup.yml -e monitoring_action=reinstall"

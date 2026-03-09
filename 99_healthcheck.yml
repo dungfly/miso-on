@@ -24,7 +24,7 @@
   environment:
     KUBECONFIG: "{{ lookup('env', 'HOME') }}/.kube/config"
   vars:
-    os_admin_password: "MisoAdmin1!"
+    os_admin_password: "{{ opensearch_admin_password }}"
     pg_cluster_name: "{{ pg_cluster_name }}"
     redis_name: "{{ redis_name }}"
     os_name: "miso-opensearch"
