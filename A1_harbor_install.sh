@@ -75,8 +75,10 @@ server {
 }
 NGINX
 sudo ln -sf /etc/nginx/sites-available/apt-mirror             /etc/nginx/sites-enabled/apt-mirror
-sudo systemctl enable --now nginx
-echo "  ✓ nginx 설치 및 기동 완료 (포트 8080)"
+# Harbor가 80/443 점유하므로 지금은 enable만 — Harbor 설치 후 기동
+sudo systemctl enable nginx
+sudo systemctl stop nginx 2>/dev/null || true
+echo "  ✓ nginx 설정 완료 (Harbor 설치 후 기동 예정)"
 
 # Docker 저장소 등록
 sudo mkdir -p /etc/apt/keyrings
@@ -183,6 +185,9 @@ fi
 
 # Harbor 설치 실행
 if [ ! -f "${HARBOR_INSTALL_DIR}/docker-compose.yml" ]; then
+  # nginx가 80포트를 점유하면 Harbor nginx 컨테이너 기동 실패 → 먼저 중지
+  echo "  nginx 중지 (80/443 포트 확보)..."
+  sudo systemctl stop nginx 2>/dev/null || true
   cd "${HARBOR_INSTALL_DIR}"
   sudo ./install.sh --with-trivy
   cd -
@@ -299,12 +304,12 @@ else
 fi
 
 # =================================================================
-# STEP 6. nginx apt mirror 서빙 설정
+# STEP 6. nginx apt mirror 서빙 기동
 # =================================================================
 echo ""
-echo ">>> [6] nginx apt mirror 서빙 확인"
-sudo nginx -t && sudo systemctl reload nginx
-echo "  ✓ nginx :8080 서빙 준비 완료"
+echo ">>> [6] nginx apt mirror 서빙 기동 (포트 8080)"
+sudo nginx -t && sudo systemctl start nginx
+echo "  ✓ nginx :8080 서빙 완료"
 
 # =================================================================
 # 완료

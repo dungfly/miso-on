@@ -98,6 +98,15 @@
         key: "{{ bastion_pubkey.stdout }}"
         state: present
 
+    - name: "miso.local DNS 설정 - resolved.conf.d 디렉토리 생성"
+      ansible.builtin.file:
+        path: /etc/systemd/resolved.conf.d
+        state: directory
+        mode: "0755"
+        owner: root
+        group: root
+      become: yes
+
     - name: "miso.local DNS 설정 (systemd-resolved → CoreDNS)"
       ansible.builtin.copy:
         dest: /etc/systemd/resolved.conf.d/miso-local.conf

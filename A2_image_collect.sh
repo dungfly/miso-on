@@ -77,6 +77,7 @@ declare -A IMAGES=(
   ["etcd"]="registry.k8s.io/etcd:3.5.15-0"
   ["coredns"]="registry.k8s.io/coredns/coredns:v1.11.3"
   # ── Calico ─────────────────────────────────────────
+  ["tigera-operator"]="quay.io/tigera/operator:v1.32.3"
   ["calico-node"]="docker.io/calico/node:v3.27.0"
   ["calico-cni"]="docker.io/calico/cni:v3.27.0"
   ["calico-kube-controllers"]="docker.io/calico/kube-controllers:v3.27.0"
@@ -246,7 +247,7 @@ declare -A MANIFESTS=(
   ["cert-manager.yaml"]="https://github.com/cert-manager/cert-manager/releases/download/v1.14.4/cert-manager.yaml"
   ["local-path-storage.yaml"]="https://raw.githubusercontent.com/rancher/local-path-provisioner/v0.0.30/deploy/local-path-storage.yaml"
   ["argocd-install.yaml"]="https://raw.githubusercontent.com/argoproj/argo-cd/v2.10.3/manifests/install.yaml"
-  ["argocd-image-updater.yaml"]="https://raw.githubusercontent.com/argoproj-labs/argocd-image-updater/stable/config/install.yaml"
+  ["argocd-image-updater.yaml"]="https://raw.githubusercontent.com/argoproj-labs/argocd-image-updater/v1.1.1/config/install.yaml"
 )
 
 MANIFEST_FAILED=()
