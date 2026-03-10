@@ -4,13 +4,19 @@
   become: yes
   tasks:
     - name: Load kernel modules for Kubernetes
-      ansible.builtin.command: modprobe {{ item }}
+      community.general.modprobe:
+        name: "{{ item }}"
+        state: present
       loop:
         - overlay
         - br_netfilter
 
     - name: Set sysctl params
-      ansible.builtin.command: sysctl -w {{ item.key }}={{ item.value }}
+      ansible.posix.sysctl:
+        name: "{{ item.key }}"
+        value: "{{ item.value }}"
+        state: present
+        reload: yes
       loop:
         - { key: 'net.bridge.bridge-nf-call-iptables', value: '1' }
         - { key: 'net.bridge.bridge-nf-call-ip6tables', value: '1' }
@@ -31,27 +37,112 @@
       args:
         creates: /etc/containerd/config.toml
 
-    - name: Restart and enable containerd
+    - name: "containerd sandbox_image를 Harbor pause:3.9로 변경"
+      ansible.builtin.replace:
+        path: /etc/containerd/config.toml
+        regexp: 'sandbox_image = ".*"'
+        replace: 'sandbox_image = "{{ harbor_domain }}/{{ harbor_project }}/pause:3.9"'
+
+    - name: "Harbor /etc/hosts 등록"
+      ansible.builtin.lineinfile:
+        path: /etc/hosts
+        regexp: "harbor\\.{{ base_domain }}$"
+        line: "{{ hostvars[groups['harbor'][0]]['ansible_host'] }} harbor.{{ base_domain }}"
+        state: present
+
+    - name: "Harbor mirror hosts.toml 디렉토리 생성"
+      ansible.builtin.file:
+        path: /etc/containerd/certs.d/{{ harbor_domain }}
+        state: directory
+        mode: "0755"
+
+    - name: "Harbor mirror hosts.toml 설정 (인증 포함)"
+      ansible.builtin.copy:
+        dest: /etc/containerd/certs.d/{{ harbor_domain }}/hosts.toml
+        mode: "0600"
+        content: |
+          server = "https://{{ harbor_domain }}"
+          [host."https://{{ harbor_domain }}"]
+            capabilities = ["pull", "resolve"]
+            skip_verify = true
+          [host."https://{{ harbor_domain }}".header]
+            Authorization = ["Basic {{ (harbor_robot_user + ':' + harbor_robot_pass) | b64encode }}"]
+
+    - name: "registry.k8s.io mirror 디렉토리 생성"
+      ansible.builtin.file:
+        path: /etc/containerd/certs.d/registry.k8s.io
+        state: directory
+        mode: "0755"
+
+    - name: "registry.k8s.io → Harbor mirror 설정"
+      ansible.builtin.copy:
+        dest: /etc/containerd/certs.d/registry.k8s.io/hosts.toml
+        mode: "0644"
+        content: |
+          server = "https://registry.k8s.io"
+          [host."https://{{ harbor_domain }}"]
+            capabilities = ["pull", "resolve"]
+            skip_verify = true
+          [host."https://{{ harbor_domain }}".header]
+            Authorization = ["Basic {{ (harbor_robot_user + ':' + harbor_robot_pass) | b64encode }}"]
+
+    - name: "docker.io mirror 디렉토리 생성"
+      ansible.builtin.file:
+        path: /etc/containerd/certs.d/docker.io
+        state: directory
+        mode: "0755"
+
+    - name: "docker.io → Harbor mirror 설정"
+      ansible.builtin.copy:
+        dest: /etc/containerd/certs.d/docker.io/hosts.toml
+        mode: "0644"
+        content: |
+          server = "https://docker.io"
+          [host."https://{{ harbor_domain }}"]
+            capabilities = ["pull", "resolve"]
+            skip_verify = true
+          [host."https://{{ harbor_domain }}".header]
+            Authorization = ["Basic {{ (harbor_robot_user + ':' + harbor_robot_pass) | b64encode }}"]
+
+    - name: "quay.io mirror 디렉토리 생성"
+      ansible.builtin.file:
+        path: /etc/containerd/certs.d/quay.io
+        state: directory
+        mode: "0755"
+
+    - name: "quay.io → Harbor mirror 설정"
+      ansible.builtin.copy:
+        dest: /etc/containerd/certs.d/quay.io/hosts.toml
+        mode: "0644"
+        content: |
+          server = "https://quay.io"
+          [host."https://{{ harbor_domain }}"]
+            capabilities = ["pull", "resolve"]
+            skip_verify = true
+          [host."https://{{ harbor_domain }}".header]
+            Authorization = ["Basic {{ (harbor_robot_user + ':' + harbor_robot_pass) | b64encode }}"]
+
+    - name: "containerd config_path 설정 (hosts.toml 활성화)"
+      ansible.builtin.replace:
+        path: /etc/containerd/config.toml
+        regexp: 'config_path = ""'
+        replace: 'config_path = "/etc/containerd/certs.d"'
+
+    - name: Restart containerd
       ansible.builtin.systemd:
         name: containerd
         state: restarted
         enabled: yes
         daemon_reload: yes
 
-    - name: K8s 로컬 저장소 확인 (A4에서 등록됐어야 함)
-      ansible.builtin.stat:
-        path: /etc/apt/sources.list.d/miso-local-k8s.list
-      register: k8s_repo_check
-
-    - name: K8s 로컬 저장소 긴급 등록 (미등록 시)
+    - name: "K8s 로컬 저장소 등록 (폐쇄망)"
       ansible.builtin.copy:
         dest: /etc/apt/sources.list.d/miso-local-k8s.list
         mode: '0644'
         content: |
-          deb [trusted=yes] http://{{ harbor_ip }}:8080/debs/k8s ./
-      when: not k8s_repo_check.stat.exists
+          deb [trusted=yes] http://{{ hostvars[groups['harbor'][0]]['ansible_host'] }}:8080/debs/k8s ./
 
-    - name: 외부 K8s 저장소 비활성화 (폐쇄망)
+    - name: "외부 K8s 저장소 비활성화"
       ansible.builtin.file:
         path: /etc/apt/sources.list.d/kubernetes.list
         state: absent
@@ -71,7 +162,7 @@
         selection: hold
       loop: [kubelet, kubeadm, kubectl]
 
-
+  handlers: []
 
 # ------------------------------------------------------------------
 
@@ -111,16 +202,11 @@
   hosts: bastion
   become: no
   gather_facts: false
-  vars:
-    harbor_ip: "{{ hostvars[groups['harbor'][0]]['ansible_host'] }}"
-    monitor_ip: "{{ hostvars[groups['monitoring'][0]]['ansible_host'] }}"
-    # Jinja2로 미리 IP 목록 생성 (shell for 루프와 혼용 방지)
-    db_node_ips: "{{ groups['db_nodes'] | map('extract', hostvars, 'ansible_host') | list }}"
   tasks:
     - name: Wait until DB nodes appear in cluster (by InternalIP)
       ansible.builtin.shell: |
         set -e
-        for ip in {{ db_node_ips | join(' ') }}; do
+        for ip in {% for h in groups['db_nodes'] %}{{ hostvars[h].ansible_host }}{% if not loop.last %} {% endif %}{% endfor %}; do
           kubectl get nodes -o wide | awk -v ip="$ip" '$6==ip {found=1} END{exit !found}'
         done
       register: node_wait
@@ -132,9 +218,9 @@
     - name: Label/Taint DB nodes (by InternalIP)
       ansible.builtin.shell: |
         set -e
-        for ip in {{ db_node_ips | join(' ') }}; do
+        for ip in {% for h in groups['db_nodes'] %}{{ hostvars[h].ansible_host }}{% if not loop.last %} {% endif %}{% endfor %}; do
           node="$(kubectl get nodes -o wide | awk -v ip="$ip" '$6==ip {print $1; exit}')"
-          echo "map: $ip -> $node"
+          echo "ip=$ip -> node=$node"
           kubectl label node "$node" node-role.kubernetes.io/db=true --overwrite
           kubectl taint node "$node" dedicated=db:NoSchedule --overwrite
         done

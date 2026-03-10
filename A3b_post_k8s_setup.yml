@@ -1,0 +1,162 @@
+---
+# =================================================================
+# A3b_post_k8s_setup.yml - K8s 클러스터 구성 후 Harbor 연동
+#
+# [실행 타이밍] phase2_k8s_cluster.yml 완료 후
+#              bash 04_get-kubeconfig_bastion.sh 완료 후
+#
+# 동작:
+#   1. Harbor imagePullSecret 생성
+#   2. CoreDNS에 harbor.miso.local 등록
+# =================================================================
+
+# ---------------------------------------------------------------
+# PLAY 1. Harbor imagePullSecret 생성
+# ---------------------------------------------------------------
+- name: "Harbor imagePullSecret 생성"
+  hosts: bastion
+  become: no
+  gather_facts: false
+  environment:
+    KUBECONFIG: "{{ lookup('env', 'HOME') }}/.kube/config"
+  tasks:
+    - name: "harbor-registry-secret 존재 여부 확인"
+      ansible.builtin.shell: |
+        kubectl get secret harbor-registry-secret -n default 2>/dev/null | wc -l
+      register: secret_check
+      changed_when: false
+
+    - name: "harbor-registry-secret 생성"
+      ansible.builtin.shell: |
+        kubectl create secret docker-registry harbor-registry-secret \
+          --docker-server={{ harbor_domain }} \
+          --docker-username=admin \
+          --docker-password={{ harbor_admin_password }} \
+          -n default
+      when: secret_check.stdout | int == 0
+
+    - name: "모든 네임스페이스에 secret 복사"
+      ansible.builtin.shell: |
+        for ns in monitoring argocd cert-manager; do
+          kubectl get ns $ns 2>/dev/null || continue
+          kubectl get secret harbor-registry-secret -n $ns 2>/dev/null && continue
+          kubectl get secret harbor-registry-secret -n default -o yaml | \
+            sed "s/namespace: default/namespace: $ns/" | \
+            kubectl apply -f -
+        done
+      changed_when: true
+
+    - name: "default ServiceAccount에 imagePullSecrets 등록"
+      ansible.builtin.shell: |
+        for ns in default monitoring argocd cert-manager; do
+          kubectl get ns $ns 2>/dev/null || continue
+          kubectl patch serviceaccount default -n $ns \
+            -p '{"imagePullSecrets":[{"name":"harbor-registry-secret"}]}'
+        done
+      changed_when: true
+
+# ---------------------------------------------------------------
+# PLAY 2. CoreDNS에 harbor.miso.local 등록 (Python JSON 방식)
+# ---------------------------------------------------------------
+- name: "CoreDNS {{ harbor_domain }} 등록"
+  hosts: bastion
+  become: no
+  gather_facts: false
+  environment:
+    KUBECONFIG: "{{ lookup('env', 'HOME') }}/.kube/config"
+  vars:
+    harbor_ip: "{{ hostvars[groups['harbor'][0]]['ansible_host'] }}"
+  tasks:
+    - name: "harbor 이미 등록됐는지 확인"
+      ansible.builtin.shell: |
+        kubectl get configmap coredns -n kube-system \
+          -o jsonpath='{.data.Corefile}' | grep -c "{{ harbor_domain }}" || true
+      register: harbor_dns_check
+      changed_when: false
+
+    - name: "CoreDNS hosts 블록에 harbor 추가 (Python JSON 방식)"
+      ansible.builtin.shell: |
+        python3 - <<'PY'
+        import subprocess, json, re, sys
+
+        harbor_entry = "{{ harbor_ip }} {{ harbor_domain }}"
+
+        raw = subprocess.check_output([
+            "kubectl","get","configmap","coredns","-n","kube-system","-o","json"
+        ]).decode()
+        cm = json.loads(raw)
+        corefile = cm["data"]["Corefile"]
+
+        # 안전 체크 - 이미 등록돼 있으면 스킵
+        if "{{ harbor_domain }}" in corefile:
+            print("Already registered - skip")
+            sys.exit(0)
+
+        # hosts 블록이 있으면 fallthrough 앞에 삽입
+        # 없으면 .:53 { 블록 내 ready 다음에 새 hosts 블록 생성
+        if re.search(r'hosts\s*\{', corefile):
+            corefile = re.sub(
+                r'(\s+)(fallthrough)',
+                lambda m: m.group(1) + harbor_entry + m.group(1) + m.group(2),
+                corefile, count=1
+            )
+        else:
+            hosts_block = (
+                "\n    hosts {\n"
+                "      " + harbor_entry + "\n"
+                "      fallthrough\n"
+                "    }\n"
+            )
+            corefile = re.sub(
+                r'(ready\s*\n)',
+                r'\1' + hosts_block,
+                corefile, count=1
+            )
+
+        cm["data"]["Corefile"] = corefile
+
+        # apply 충돌 방지용 메타 제거
+        for field in ["resourceVersion","uid","creationTimestamp","generation","managedFields"]:
+            cm.get("metadata", {}).pop(field, None)
+
+        p = subprocess.run(
+            ["kubectl","apply","-f","-"],
+            input=json.dumps(cm).encode(),
+            capture_output=True
+        )
+        sys.stdout.write(p.stdout.decode())
+        if p.returncode != 0:
+            sys.stderr.write(p.stderr.decode())
+            sys.exit(p.returncode)
+        PY
+      when: harbor_dns_check.stdout == "0"
+      register: dns_update
+      changed_when: "'configmap' in dns_update.stdout"
+
+    - name: "CoreDNS 롤링 재시작"
+      ansible.builtin.shell: |
+        kubectl rollout restart deployment coredns -n kube-system
+        kubectl rollout status deployment coredns -n kube-system --timeout=60s
+      when: dns_update is changed
+      changed_when: true
+
+    - name: "적용 결과 확인"
+      ansible.builtin.shell: |
+        kubectl get configmap coredns -n kube-system \
+          -o jsonpath='{.data.Corefile}' | grep -A3 "hosts"
+      register: verify_out
+      changed_when: false
+      failed_when: false
+
+    - name: "결과 출력"
+      ansible.builtin.debug:
+        msg: "{{ verify_out.stdout_lines | default([]) }}"
+
+    - name: "완료"
+      ansible.builtin.debug:
+        msg:
+          - "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          - " Harbor K8s 연동 완료"
+          - " - imagePullSecret 생성 완료"
+          - " - CoreDNS {{ harbor_domain }} 등록 완료"
+          - "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"

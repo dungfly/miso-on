@@ -26,6 +26,7 @@
     KUBECONFIG: "{{ lookup('env', 'HOME') }}/.kube/config"
   vars:
     cert_dir: "{{ playbook_dir }}"
+    harbor_ip: "{{ hostvars[groups['harbor'][0]]['ansible_host'] }}"
 
     # K8s wildcard secret 이름 (전 네임스페이스 공통)
 
@@ -130,7 +131,6 @@
           namespace: {{ os_namespace }}
           annotations:
             kubernetes.io/ingress.class: nginx
-            nginx.ingress.kubernetes.io/backend-protocol: "HTTPS"
             nginx.ingress.kubernetes.io/force-ssl-redirect: "true"
             nginx.ingress.kubernetes.io/ssl-redirect: "true"
         spec:
@@ -239,9 +239,38 @@
     # STEP 7. Grafana nginx reverse proxy + TLS 설정
     # (monitor VM에서 직접 처리)
     # ---------------------------------------------------------------
-    - name: "7-a. nginx 설치 (monitor VM)"
+    - name: "7-a-0. monitor VM 로컬 apt repo 등록 (nginx용)"
+      ansible.builtin.copy:
+        dest: /etc/apt/sources.list.d/harbor-monitor.list
+        content: |
+          deb [trusted=yes] http://{{ harbor_ip }}:8080/debs/monitor ./
+        mode: "0644"
+      become: yes
+      delegate_to: "{{ groups['monitoring'][0] }}"
+
+    - name: "7-a-1. 외부 Ubuntu repo 비활성화 (monitor VM)"
+      ansible.builtin.file:
+        path: /etc/apt/sources.list
+        state: absent
+      become: yes
+      delegate_to: "{{ groups['monitoring'][0] }}"
+
+    - name: "7-a-2. monitor repo 목록 확인"
+      ansible.builtin.shell: |
+        ls -1 /etc/apt/sources.list.d/ || true
+        grep -R "^deb " /etc/apt/sources.list.d/ 2>/dev/null || true
+      become: yes
+      delegate_to: "{{ groups['monitoring'][0] }}"
+      register: monitor_repo_check
+      changed_when: false
+
+    - name: "7-a-3. monitor repo 확인 출력"
+      ansible.builtin.debug:
+        var: monitor_repo_check.stdout_lines
+
+    - name: "7-a. nginx-core 설치 (monitor VM)"
       ansible.builtin.apt:
-        name: nginx
+        name: nginx-core
         state: present
         update_cache: yes
       become: yes
@@ -299,6 +328,7 @@
                   proxy_set_header   X-Real-IP $remote_addr;
                   proxy_set_header   X-Forwarded-For $proxy_add_x_forwarded_for;
                   proxy_set_header   X-Forwarded-Proto $scheme;
+                  proxy_redirect     http://localhost:3000/ https://{{ monitor_domain }}/;
               }
           }
 
@@ -376,6 +406,12 @@
 
     - name: "7-g. CA 신뢰 저장소 업데이트 (monitor VM)"
       ansible.builtin.shell: update-ca-certificates
+      become: yes
+      delegate_to: "{{ groups['monitoring'][0] }}"
+      changed_when: true
+
+    - name: "7-h. nginx 설정 검증 후 즉시 재시작 (monitor VM)"
+      ansible.builtin.shell: nginx -t && systemctl restart nginx
       become: yes
       delegate_to: "{{ groups['monitoring'][0] }}"
       changed_when: true

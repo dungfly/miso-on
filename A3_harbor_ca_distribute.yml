@@ -1,15 +1,13 @@
 ---
 # =================================================================
-# A3_harbor_ca_distribute.yml - Harbor CA 인증서 K8s 노드 배포
+# A3_harbor_ca_distribute.yml - Harbor CA 인증서 전체 노드 배포
 #
-# [실행 타이밍] K8s 클러스터 구성(phase1~2) 완료 후 실행
-#
-# 실행: ansible-playbook -i ../hosts.ini A3_harbor_ca_distribute.yml
+# [실행 타이밍] phase1_infra_base.yml 실행 전 (K8s 불필요)
 #
 # 동작:
-#   1. K8s 전체 노드에 Harbor CA 시스템 신뢰 등록
-#   2. K8s 노드 containerd에 Harbor 인증서 등록
-#   3. CoreDNS에 {{ harbor_domain }} 등록
+#   1. Harbor CA를 모든 노드 시스템 신뢰 저장소에 등록
+#   2. bastion/monitoring /etc/hosts 등록
+#   3. containerd에 Harbor CA + robot auth 등록 (K8s 노드)
 # =================================================================
 
 # ---------------------------------------------------------------
@@ -42,10 +40,10 @@
       when: not ca_file.stat.exists
 
 # ---------------------------------------------------------------
-# PLAY 2. 전체 K8s 노드 + LB 시스템 CA 등록 + DNS 설정
+# PLAY 2. 전체 노드 시스템 CA 등록 (K8s + LB + bastion + monitoring)
 # ---------------------------------------------------------------
-- name: "Harbor CA 시스템 신뢰 등록 (K8s 노드 + LB)"
-  hosts: k8s:lb
+- name: "Harbor CA 시스템 신뢰 등록 (전체 노드)"
+  hosts: all
   become: yes
   gather_facts: false
   tasks:
@@ -59,58 +57,27 @@
       ansible.builtin.shell: update-ca-certificates
       changed_when: true
 
-    - name: "systemd-resolved conf 디렉토리 생성"
-      ansible.builtin.file:
-        path: /etc/systemd/resolved.conf.d
-        state: directory
-        mode: "0755"
-
-    - name: "{{ base_domain }} DNS → CoreDNS 라우팅 설정"
-      ansible.builtin.copy:
-        dest: /etc/systemd/resolved.conf.d/miso-local.conf
-        mode: "0644"
-        content: |
-          [Resolve]
-          DNS=10.96.0.10
-          Domains=~{{ base_domain }}
-      notify: Restart systemd-resolved
-
-  handlers:
-    - name: Restart systemd-resolved
-      ansible.builtin.systemd:
-        name: systemd-resolved
-        state: restarted
+    - name: "harbor.miso.local /etc/hosts 등록"
+      ansible.builtin.lineinfile:
+        path: /etc/hosts
+        regexp: "{{ harbor_domain }}$"
+        line: "{{ hostvars[groups['harbor'][0]]['ansible_host'] }} {{ harbor_domain }}"
+        state: present
 
 # ---------------------------------------------------------------
-# PLAY 2-b. Bastion /etc/hosts 등록 (ClusterIP 직접 접근 불가)
+# PLAY 3. bastion /etc/hosts 도메인 등록
 # ---------------------------------------------------------------
-- name: "Bastion + Monitoring /etc/hosts에 {{ base_domain }} 도메인 등록"
+- name: "Bastion + Monitoring /etc/hosts 도메인 등록"
   hosts: bastion:monitoring
   become: yes
   gather_facts: false
   vars:
-    harbor_ip: "{{ hostvars[groups['harbor'][0]]['ansible_host'] }}"
     monitor_ip: "{{ hostvars[groups['monitoring'][0]]['ansible_host'] }}"
   tasks:
-    - name: "Harbor CA 시스템 신뢰 등록"
-      ansible.builtin.copy:
-        src: /tmp/harbor-ca.crt
-        dest: /usr/local/share/ca-certificates/harbor.crt
-        mode: "0644"
-
-    - name: "CA 인증서 적용"
-      ansible.builtin.shell: update-ca-certificates
-      changed_when: true
-
-    - name: "{{ harbor_domain }} /etc/hosts 등록"
-      ansible.builtin.lineinfile:
-        path: /etc/hosts
-        line: "{{ harbor_ip }} {{ harbor_domain }}"
-        state: present
-
     - name: "monitoring 도메인 /etc/hosts 등록"
       ansible.builtin.lineinfile:
         path: /etc/hosts
+        regexp: "{{ item }}$"
         line: "{{ monitor_ip }} {{ item }}"
         state: present
       loop:
@@ -143,30 +110,31 @@
       ignore_errors: yes
 
 # ---------------------------------------------------------------
-# PLAY 3. K8s 노드 containerd 인증서 등록
+# PLAY 4. K8s 노드 containerd Harbor CA + robot auth 등록
+# (03_k8s_masters.yml의 hosts.toml과 일관성 유지)
 # ---------------------------------------------------------------
 - name: "Harbor CA containerd 등록 (K8s 노드)"
   hosts: k8s
   become: yes
   gather_facts: false
-  vars:
-    harbor_hostname: "{{ harbor_domain }}"
   tasks:
-    - name: "containerd certs.d 디렉토리 생성"
+    - name: "containerd certs.d/harbor 디렉토리 생성"
       ansible.builtin.file:
-        path: "/etc/containerd/certs.d/{{ harbor_hostname }}"
+        path: "/etc/containerd/certs.d/{{ harbor_domain }}"
         state: directory
         mode: "0755"
 
-    - name: "containerd에 Harbor 인증서 등록"
+    - name: "containerd Harbor hosts.toml 등록 (CA + robot auth)"
       ansible.builtin.copy:
-        dest: "/etc/containerd/certs.d/{{ harbor_hostname }}/hosts.toml"
-        mode: "0644"
+        dest: "/etc/containerd/certs.d/{{ harbor_domain }}/hosts.toml"
+        mode: "0600"
         content: |
-          server = "https://{{ harbor_hostname }}"
-
-          [host."https://{{ harbor_hostname }}"]
+          server = "https://{{ harbor_domain }}"
+          [host."https://{{ harbor_domain }}"]
+            capabilities = ["pull", "resolve"]
             ca = "/usr/local/share/ca-certificates/harbor.crt"
+          [host."https://{{ harbor_domain }}".header]
+            Authorization = ["Basic {{ (harbor_robot_user + ':' + harbor_robot_pass) | b64encode }}"]
       notify: Restart containerd
 
   handlers:
@@ -177,113 +145,21 @@
       ignore_errors: yes
 
 # ---------------------------------------------------------------
-# PLAY 3-b. K8s imagePullSecret 생성 (miso 프로젝트 private)
+# PLAY 5. 완료 안내
 # ---------------------------------------------------------------
-- name: "Harbor imagePullSecret 생성"
-  hosts: bastion
-  become: no
+- name: "완료 안내"
+  hosts: localhost
   gather_facts: false
-  environment:
-    KUBECONFIG: "{{ lookup('env', 'HOME') }}/.kube/config"
-  vars:
-    harbor_user: "admin"
-    harbor_password: "{{ harbor_admin_password }}"
-    harbor_server: "{{ harbor_domain }}"
   tasks:
-    - name: "harbor-registry-secret 존재 여부 확인"
-      ansible.builtin.shell: |
-        kubectl get secret harbor-registry-secret -n default 2>/dev/null | wc -l
-      register: secret_check
-      changed_when: false
-
-    - name: "harbor-registry-secret 생성"
-      ansible.builtin.shell: |
-        kubectl create secret docker-registry harbor-registry-secret           --docker-server={{ harbor_server }}           --docker-username={{ harbor_user }}           --docker-password={{ harbor_password }}           -n default
-      when: secret_check.stdout | int == 0
-
-    - name: "모든 네임스페이스에 secret 복사 (monitoring, argocd 등)"
-      ansible.builtin.shell: |
-        for ns in monitoring argocd cert-manager; do
-          kubectl get ns $ns 2>/dev/null || continue
-          kubectl get secret harbor-registry-secret -n $ns 2>/dev/null && continue
-          kubectl get secret harbor-registry-secret -n default -o yaml | \
-            sed "s/namespace: default/namespace: $ns/" | \
-            kubectl apply -f -
-        done
-      changed_when: true
-
-    - name: "default ServiceAccount에 imagePullSecrets 등록 (모든 네임스페이스 자동 적용)"
-      ansible.builtin.shell: |
-        for ns in default monitoring argocd cert-manager; do
-          kubectl get ns $ns 2>/dev/null || continue
-          kubectl patch serviceaccount default -n $ns \
-            -p '{"imagePullSecrets":[{"name":"harbor-registry-secret"}]}'
-        done
-      changed_when: true
-
-# ---------------------------------------------------------------
-# PLAY 4. CoreDNS에 {{ harbor_domain }} 등록
-# ---------------------------------------------------------------
-- name: "CoreDNS {{ harbor_domain }} 등록"
-  hosts: bastion
-  become: no
-  gather_facts: false
-  environment:
-    KUBECONFIG: "{{ lookup('env', 'HOME') }}/.kube/config"
-  tasks:
-    - name: "{{ harbor_domain }} 이미 등록됐는지 확인"
-      ansible.builtin.shell: |
-        kubectl get configmap coredns -n kube-system \
-          -o jsonpath='{.data.Corefile}' | grep -c "{{ harbor_domain }}" || true
-      register: harbor_dns_check
-      changed_when: false
-
-    - name: "CoreDNS hosts 블록에 harbor 추가"
-      ansible.builtin.shell: |
-        # 기존 hosts 블록이 있으면 그 안에 항목 추가, 없으면 새로 생성
-        COREFILE=$(kubectl get configmap coredns -n kube-system -o jsonpath='{.data.Corefile}')
-        if echo "$COREFILE" | grep -q "hosts {"; then
-          # 기존 hosts 블록의 fallthrough 앞에 harbor 항목 삽입
-          kubectl get configmap coredns -n kube-system -o json | \
-          sed 's/      fallthrough/      {{ harbor_ip }} {{ harbor_domain }}\n      fallthrough/' | \
-          kubectl apply -f -
-        else
-          # hosts 블록이 없으면 ready 다음에 새 블록 생성
-          kubectl get configmap coredns -n kube-system -o json | \
-          sed 's/    ready/    ready\n    hosts {\n      {{ harbor_ip }} {{ harbor_domain }}\n      fallthrough\n    }/' | \
-          kubectl apply -f -
-        fi
-      when: harbor_dns_check.stdout == "0"
-      register: dns_update
-
-    - name: "CoreDNS 롤링 재시작"
-      ansible.builtin.shell: |
-        kubectl rollout restart deployment coredns -n kube-system
-        kubectl rollout status deployment coredns -n kube-system --timeout=60s
-      when: dns_update is changed
-      changed_when: true
-
-    - name: "{{ harbor_domain }} DNS 확인"
-      ansible.builtin.shell: |
-        nslookup {{ harbor_domain }} 2>/dev/null || true
-      register: dns_check
-      changed_when: false
-      failed_when: false
-
-    - name: "DNS 결과 출력"
-      ansible.builtin.debug:
-        msg: "{{ dns_check.stdout_lines }}"
-
-    - name: "완료 안내"
+    - name: "완료"
       ansible.builtin.debug:
         msg:
           - "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
           - " Harbor CA 배포 완료"
           - "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-          - " - K8s 전체 노드 시스템 CA 등록 완료"
-          - " - containerd Harbor 인증서 등록 완료"
-          - " - CoreDNS {{ harbor_domain }} 등록 완료"
+          - " - 전체 노드 시스템 CA 등록 완료"
+          - " - containerd Harbor CA + robot auth 등록 완료"
+          - " - /etc/hosts 도메인 등록 완료"
           - ""
-          - " 다음 단계:"
-          - "   ansible-playbook -i hosts.ini phase4_infra_services.yml"
+          - " 다음 단계: phase1_infra_base.yml → reboot_all.yml"
           - "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"

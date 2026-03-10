@@ -4,18 +4,10 @@
 #
 # 설치 전 반드시 검토 후 수정하세요.
 # 이 파일 하나만 수정하면 모든 플레이북에 자동 반영됩니다.
-#
-# 실행 순서:
-#   1. 이 파일 수정
-#   2. hosts.ini 수정 (서버 IP)
-#   3. 루트 폴더에 인증서 파일 위치 (ca.crt / tls.crt / tls.key)
-#   4. 플레이북 순서대로 실행
 # =============================================================================
-
 
 # -----------------------------------------------------------------------------
 # [1] 도메인
-#     base_domain 만 변경하면 모든 서브도메인이 자동으로 맞춰집니다.
 # -----------------------------------------------------------------------------
 base_domain: "miso.local"
 
@@ -32,74 +24,46 @@ postgres_rw_domain:   "postgres-rw.{{ base_domain }}"
 postgres_ro_domain:   "postgres-ro.{{ base_domain }}"
 redis_domain:         "redis.{{ base_domain }}"
 
-
 # -----------------------------------------------------------------------------
 # [2] 인증서
-#     플레이북 루트 폴더에 아래 세 파일을 위치시키면 자동으로 사용됩니다.
-#       ca.crt  - CA 인증서 (외부 인증서라면 체인 포함본)
-#       tls.crt - 서버 인증서 (와일드카드 또는 멀티도메인 SAN)
-#       tls.key - 서버 개인키
-#     자체 서명 인증서가 필요하면 00_gen_cert.sh 를 먼저 실행하세요.
 # -----------------------------------------------------------------------------
-cert_dir: "{{ playbook_dir }}"
-ca_cert:  "{{ cert_dir }}/ca.crt"
-tls_cert: "{{ cert_dir }}/tls.crt"
-tls_key:  "{{ cert_dir }}/tls.key"
-
-# K8s TLS Secret 이름 (19_ssl_setup.yml 에서 생성)
+cert_dir:    "{{ playbook_dir }}"
+ca_cert:     "{{ cert_dir }}/ca.crt"
+tls_cert:    "{{ cert_dir }}/tls.crt"
+tls_key:     "{{ cert_dir }}/tls.key"
 wildcard_secret: "wildcard-tls"
 
-
 # -----------------------------------------------------------------------------
-# [3] 패스워드
-#     ★ 아래 패스워드는 설치 전 반드시 변경하세요 ★
-#
-#     [설치 후 UI에서 변경 가능한 항목]
-#       Harbor    : 우상단 프로필 → Change Password
-#       Grafana   : Profile → Change Password
-#       MinIO     : Identity → Users
-#       OpenSearch: Security → Internal Users
-#
-#     [주의] Redis 패스워드 변경 시 Redis를 참조하는 앱 설정도 함께 수정 필요
-#
-#     [자동 생성되어 여기서 설정 불가한 항목]
-#       PostgreSQL : CNPG 가 자동 생성. 설치 후 아래 명령으로 확인
-#                   kubectl get secret {{ pg_cluster_name }}-app \
-#                     -o jsonpath='{.data.password}' | base64 -d
-#       ArgoCD     : 설치 시 랜덤 생성. 설치 후 아래 명령으로 확인 후 UI에서 변경
-#                   kubectl get secret argocd-initial-admin-secret \
-#                     -n argocd -o jsonpath='{.data.password}' | base64 -d
+# [3] 패스워드  ★ 설치 전 반드시 변경하세요 ★
 # -----------------------------------------------------------------------------
-harbor_admin_password:     "Harbor12345"    # Harbor  admin
-grafana_admin_password:    "misomonitor"    # Grafana admin
-minio_root_user:           "misoadmin"      # MinIO   root 계정명
-minio_root_password:       "misopassword"   # MinIO   root
-opensearch_admin_password: "MisoAdmin1!"    # OpenSearch admin (대소문자+숫자+특수문자 필수)
-redis_password:            "misoredis"      # Redis   AUTH 패스워드
-
+harbor_admin_password:     "Harbor12345"
+grafana_admin_password:    "misomonitor"
+minio_root_user:           "misoadmin"
+minio_root_password:       "misopassword"
+opensearch_admin_password: "Misoopen!!"
+redis_password:            "misoredis"
 
 # -----------------------------------------------------------------------------
 # [4] Harbor
 # -----------------------------------------------------------------------------
-harbor_project:  "miso"
-harbor_registry: "{{ harbor_domain }}"
-image_prefix:    "{{ harbor_registry }}/{{ harbor_project }}"
-
-harbor_cert_dir: "/etc/harbor/certs"
-harbor_cert_src: "{{ tls_cert }}"
-harbor_key_src:  "{{ tls_key }}"
-
+harbor_project:    "miso"
+harbor_registry:   "{{ harbor_domain }}"
+image_prefix:      "{{ harbor_registry }}/{{ harbor_project }}"
+harbor_cert_dir:   "/etc/harbor/certs"
+harbor_cert_src:   "{{ tls_cert }}"
+harbor_key_src:    "{{ tls_key }}"
 image_pull_secret: "harbor-registry-secret"
 
+# Harbor Robot Account (A1_harbor_install.sh 실행 후 자동 생성)
+harbor_robot_user: "robot$miso+node-pull"
+harbor_robot_pass: "{{ lookup('file', '~/harbor-robot-secret.txt') | split(':') | last }}"
 
 # -----------------------------------------------------------------------------
 # [5] PostgreSQL (CNPG)
-#     패스워드는 CNPG 가 자동 생성합니다 (위 [3] 참고).
 # -----------------------------------------------------------------------------
 pg_cluster_name: "miso-db"
 pg_db_name:      "miso"
 pg_db_owner:     "miso_admin"
-
 
 # -----------------------------------------------------------------------------
 # [6] Redis
@@ -107,23 +71,20 @@ pg_db_owner:     "miso_admin"
 redis_name:          "miso-redis"
 redis_sentinel_name: "miso-redis-master"
 
-
 # -----------------------------------------------------------------------------
 # [7] OpenSearch
 # -----------------------------------------------------------------------------
 os_name:      "opensearch"
 os_namespace: "default"
 
-
 # -----------------------------------------------------------------------------
 # [8] 시스템
-#     일반적으로 수정할 필요 없습니다.
 # -----------------------------------------------------------------------------
 timezone:    "Asia/Seoul"
 k8s_version: "1.30"
 pod_cidr:    "10.244.0.0/16"
 
-# 인프라 IP (hosts.ini 의 ansible_host 를 자동 참조, 수정 불필요)
+# 인프라 IP (hosts.ini 의 ansible_host 자동 참조, 수정 불필요)
 harbor_ip:    "{{ hostvars[groups['harbor'][0]]['ansible_host'] }}"
 monitor_ip:   "{{ hostvars[groups['monitoring'][0]]['ansible_host'] }}"
 api_endpoint: "{{ hostvars[groups['lb'][0]]['ansible_host'] }}"

@@ -7,5 +7,4 @@
 # =================================================================
 - import_playbook: 03_k8s_masters.yml
 - import_playbook: 05_k8s_workers.yml
-- import_playbook: 06_k8s_ingress.yml
-- import_playbook: 08_k8s_storage.yml
+

@@ -39,7 +39,6 @@
 
   vars:
     redis_namespace: "default"
-    redis_name: "{{ redis_name }}"
     redis_action: "install"       # install / remove (PVC 보존) / purge (완전 삭제)
 
     # 이미지
@@ -61,7 +60,6 @@
     redis_storageclass: "local-path"
 
     # 자격증명
-    redis_password: "{{ redis_password }}"
 
     # db_nodes 배치 (Redis Data 전용)
     db_node_label_key: "node-role.kubernetes.io/db"
@@ -549,7 +547,7 @@
         lines = corefile.splitlines(True)
         insert_at = None
         for i, l in enumerate(lines):
-            if "rewrite name exact" in l and base_domain in l:
+            if "rewrite name exact" in l and "{{ base_domain }}" in l:
                 insert_at = i + 1
 
         if insert_at is None:

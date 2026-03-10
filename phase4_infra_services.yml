@@ -5,5 +5,7 @@
 # 실행: ansible-playbook -i hosts.ini phase4_infra_services.yml
 # 소요: 약 10분
 # =================================================================
+- import_playbook: 06_k8s_ingress.yml
+- import_playbook: 08_k8s_storage.yml
 - import_playbook: 07_cert_setup.yml
 - import_playbook: 8.5_coredns_setup.yml

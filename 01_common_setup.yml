@@ -110,6 +110,37 @@
         group: root
       notify: Restart systemd-resolved
 
+    - name: "Harbor /etc/hosts 등록"
+      ansible.builtin.lineinfile:
+        path: /etc/hosts
+        regexp: "harbor.{{ base_domain }}$"
+        line: "{{ harbor_ip }} harbor.{{ base_domain }}"
+        state: present
+
+    - name: "containerd hosts.toml 디렉토리 생성 (harbor)"
+      ansible.builtin.file:
+        path: /etc/containerd/certs.d/{{ harbor_domain }}
+        state: directory
+        mode: "0755"
+
+    - name: "containerd harbor mirror hosts.toml 설정"
+      ansible.builtin.copy:
+        dest: /etc/containerd/certs.d/{{ harbor_domain }}/hosts.toml
+        mode: "0644"
+        content: |
+          server = "https://{{ harbor_domain }}"
+          [host."https://{{ harbor_domain }}"]
+            capabilities = ["pull", "resolve"]
+            skip_verify = true
+
+    - name: "containerd config_path 설정 (hosts.toml 활성화)"
+      ansible.builtin.replace:
+        path: /etc/containerd/config.toml
+        regexp: 'config_path = ""'
+        replace: 'config_path = "/etc/containerd/certs.d"'
+      notify: Restart containerd
+      ignore_errors: yes
+
     - name: Post-Installation Message
       debug:
         msg: "시스템 기초 설정이 완료되었습니다. 클러스터 구성 전 재부팅을 권장합니다."
@@ -117,4 +148,8 @@
     - name: Restart systemd-resolved
       ansible.builtin.systemd:
         name: systemd-resolved
+        state: restarted
+    - name: Restart containerd
+      ansible.builtin.systemd:
+        name: containerd
         state: restarted

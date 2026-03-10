@@ -64,8 +64,35 @@ fi
 echo ""
 echo ">>> [1] 컨테이너 이미지 수집"
 
+# K8s 버전 (A2 상단 vars와 맞출 것)
+K8S_VERSION="v1.30.14"
+
 declare -A IMAGES=(
-  ["minio"]="quay.io/minio/minio:latest"
+  # ── K8s 시스템 이미지 ──────────────────────────────
+  ["kube-apiserver"]="registry.k8s.io/kube-apiserver:${K8S_VERSION}"
+  ["kube-controller-manager"]="registry.k8s.io/kube-controller-manager:${K8S_VERSION}"
+  ["kube-scheduler"]="registry.k8s.io/kube-scheduler:${K8S_VERSION}"
+  ["kube-proxy"]="registry.k8s.io/kube-proxy:${K8S_VERSION}"
+  ["pause"]="registry.k8s.io/pause:3.9"
+  ["etcd"]="registry.k8s.io/etcd:3.5.15-0"
+  ["coredns"]="registry.k8s.io/coredns/coredns:v1.11.3"
+  # ── Calico ─────────────────────────────────────────
+  ["calico-node"]="docker.io/calico/node:v3.27.0"
+  ["calico-cni"]="docker.io/calico/cni:v3.27.0"
+  ["calico-kube-controllers"]="docker.io/calico/kube-controllers:v3.27.0"
+  ["calico-typha"]="docker.io/calico/typha:v3.27.0"
+  ["calico-apiserver"]="docker.io/calico/apiserver:v3.27.0"
+  ["calico-csi"]="docker.io/calico/csi:v3.27.0"
+  ["calico-node-driver-registrar"]="docker.io/calico/node-driver-registrar:v3.27.0"
+  ["calico-pod2daemon-flexvol"]="docker.io/calico/pod2daemon-flexvol:v3.27.0"
+  ["calico-dikastes"]="docker.io/calico/dikastes:v3.27.0"
+  # ── Ingress-nginx ───────────────────────────────────
+  ["ingress-nginx-controller"]="registry.k8s.io/ingress-nginx/controller:v1.10.1"
+  ["ingress-nginx-kube-webhook-certgen"]="registry.k8s.io/ingress-nginx/kube-webhook-certgen:v1.4.1"
+  # ── local-path-provisioner ──────────────────────────
+  ["local-path-provisioner"]="rancher/local-path-provisioner:v0.0.30"
+  # ── 앱 이미지 ──────────────────────────────────────
+  ["minio"]="quay.io/minio/minio:RELEASE.2024-11-07T00-52-20Z"
   ["postgres"]="ghcr.io/cloudnative-pg/postgresql:16"
   ["cnpg"]="ghcr.io/cloudnative-pg/cloudnative-pg:1.22.1"
   ["redis"]="redis:7.4.3-alpine"
@@ -79,7 +106,9 @@ declare -A IMAGES=(
   ["promtail"]="grafana/promtail:2.9.8"
   ["node-exporter"]="prom/node-exporter:v1.7.0"
   ["argocd"]="quay.io/argoproj/argocd:v2.10.3"
-  ["argocd-image-updater"]="quay.io/argoprojlabs/argocd-image-updater:v0.12.2"
+  ["argocd-dex"]="ghcr.io/dexidp/dex:v2.37.0"
+  ["argocd-redis"]="redis:7.0.14-alpine"
+  ["argocd-image-updater"]="quay.io/argoprojlabs/argocd-image-updater:v1.1.1"
   ["cert-manager-controller"]="quay.io/jetstack/cert-manager-controller:v1.14.4"
   ["cert-manager-webhook"]="quay.io/jetstack/cert-manager-webhook:v1.14.4"
   ["cert-manager-cainjector"]="quay.io/jetstack/cert-manager-cainjector:v1.14.4"
@@ -115,6 +144,10 @@ for name in "${!IMAGES[@]}"; do
     IMAGE_FAILED+=("${name}")
   fi
 done
+
+# busybox:1.36을 latest로도 태깅 (local-path provisioner helper용)
+echo ">>> busybox:1.36 → busybox:latest 추가 태깅"
+sudo docker tag ${HARBOR_HOST}/${HARBOR_PROJECT}/busybox:1.36 ${HARBOR_HOST}/${HARBOR_PROJECT}/busybox:latest 2>/dev/null &&   sudo docker push ${HARBOR_HOST}/${HARBOR_PROJECT}/busybox:latest ||   echo "  ✗ busybox latest 태깅 실패 (busybox:1.36 push 성공 후 재시도)"
 
 # =================================================================
 # 2. deb 패키지 수집

@@ -4,10 +4,32 @@
   become: no
   environment:
     KUBECONFIG: "{{ lookup('env', 'HOME') }}/.kube/config"
+  vars:
+    harbor_ip: "{{ hostvars[groups['harbor'][0]]['ansible_host'] }}"
   tasks:
+    - name: "기존 local-path-storage 네임스페이스 삭제 (재설치 대비)"
+      ansible.builtin.shell: |
+        if kubectl get namespace local-path-storage --no-headers 2>/dev/null | grep -q .; then
+          kubectl delete namespace local-path-storage --wait=true --timeout=60s
+        fi
+        kubectl delete storageclass local-path --ignore-not-found=true
+      changed_when: true
+      failed_when: false
+
+    - name: "local-path manifest 다운로드"
+      ansible.builtin.shell: |
+        curl -fsSL -o /tmp/local-path-storage.yaml \
+          http://{{ harbor_ip }}:8080/manifests/local-path-storage.yaml
+
+    - name: "local-path image Harbor 경로로 rewrite"
+      ansible.builtin.shell: |
+        sed -i 's|rancher/local-path-provisioner:v0.0.30|{{ harbor_domain }}/{{ harbor_project }}/local-path-provisioner:v0.0.30|g' /tmp/local-path-storage.yaml
+        sed -i 's|image: busybox|image: {{ harbor_domain }}/{{ harbor_project }}/busybox:latest|g' /tmp/local-path-storage.yaml
+        sed -i 's|@sha256:[a-f0-9]*||g' /tmp/local-path-storage.yaml
+
     - name: "Local Path Provisioner 매니페스트 적용"
       ansible.builtin.shell: |
-        kubectl apply -f http://{{ harbor_ip }}:8080/manifests/local-path-storage.yaml --validate=false
+        kubectl apply -f /tmp/local-path-storage.yaml --validate=false
 
     - name: "local-path StorageClass 등록 완료 대기"
       ansible.builtin.shell: |
@@ -22,6 +44,19 @@
       ansible.builtin.shell: |
         kubectl patch storageclass local-path \
           -p '{"metadata": {"annotations":{"storageclass.kubernetes.io/is-default-class":"true"}}}'
+
+    - name: "local-path ConfigMap helperImage Harbor로 고정"
+      ansible.builtin.shell: |
+        kubectl patch configmap local-path-config -n local-path-storage \
+          --type merge \
+          -p '{"data":{"config.json":"{\"nodePathMap\":[{\"node\":\"DEFAULT_PATH_FOR_NON_LISTED_NODES\",\"paths\":[\"\/opt\/local-path-provisioner\"]}],\"helperImage\":\"{{ harbor_domain }}/{{ harbor_project }}/busybox:latest\"}"}}' 
+      changed_when: true
+
+    - name: "local-path provisioner 재시작 (ConfigMap 반영)"
+      ansible.builtin.shell: |
+        kubectl rollout restart deployment -n local-path-storage local-path-provisioner
+        kubectl rollout status deployment -n local-path-storage local-path-provisioner --timeout=60s
+      changed_when: true
 
     - name: "설치 확인"
       ansible.builtin.shell: kubectl get sc

@@ -27,7 +27,6 @@
     harbor_hostname: "{{ harbor_domain }}"
     harbor_project: "miso"
     harbor_admin_user: "admin"
-    harbor_admin_password: "{{ harbor_admin_password }}"
 
     argocd_manifest: "http://{{ hostvars[groups['harbor'][0]]['ansible_host'] }}:8080/manifests/argocd-install.yaml"
     image_updater_manifest: "http://{{ hostvars[groups['harbor'][0]]['ansible_host'] }}:8080/manifests/argocd-image-updater.yaml"
@@ -78,10 +77,21 @@
           --dry-run=client -o yaml | kubectl apply -f -
       changed_when: false
 
+    - name: "1-b. ArgoCD manifest 다운로드"
+      ansible.builtin.shell: |
+        curl -fsSL -o /tmp/argocd-install.yaml {{ argocd_manifest }}
+
+    - name: "1-b. ArgoCD manifest image Harbor로 rewrite"
+      ansible.builtin.shell: |
+        sed -i 's|quay.io/argoproj/argocd:v2.10.3|{{ harbor_domain }}/{{ harbor_project }}/argocd:v2.10.3|g' /tmp/argocd-install.yaml
+        sed -i 's|ghcr.io/dexidp/dex:v2.37.0|{{ harbor_domain }}/{{ harbor_project }}/argocd-dex:v2.37.0|g' /tmp/argocd-install.yaml
+        sed -i 's|redis:7.0.14-alpine|{{ harbor_domain }}/{{ harbor_project }}/argocd-redis:7.0.14-alpine|g' /tmp/argocd-install.yaml
+        sed -i 's|@sha256:[a-f0-9]*||g' /tmp/argocd-install.yaml
+
     - name: "1-b. ArgoCD manifest 적용"
       ansible.builtin.shell: |
         kubectl apply -n {{ argocd_namespace }} \
-          -f {{ argocd_manifest }}
+          -f /tmp/argocd-install.yaml
       register: argocd_install
       changed_when: "'created' in argocd_install.stdout or 'configured' in argocd_install.stdout"
 
@@ -183,10 +193,16 @@
     # ---------------------------------------------------------------
     # STEP 5. ArgoCD Image Updater 설치
     # ---------------------------------------------------------------
+    - name: "5-a. Image Updater manifest 다운로드 및 rewrite"
+      ansible.builtin.shell: |
+        curl -fsSL -o /tmp/argocd-image-updater.yaml {{ image_updater_manifest }}
+        sed -i 's|quay.io/argoprojlabs/argocd-image-updater:v1.1.1|{{ harbor_domain }}/{{ harbor_project }}/argocd-image-updater:v1.1.1|g' /tmp/argocd-image-updater.yaml
+        sed -i 's|@sha256:[a-f0-9]*||g' /tmp/argocd-image-updater.yaml
+
     - name: "5-a. Image Updater manifest 적용"
       ansible.builtin.shell: |
         kubectl apply -n {{ argocd_namespace }} \
-          -f {{ image_updater_manifest }}
+          -f /tmp/argocd-image-updater.yaml
       register: updater_install
       changed_when: "'created' in updater_install.stdout or 'configured' in updater_install.stdout"
 

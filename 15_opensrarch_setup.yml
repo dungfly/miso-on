@@ -7,7 +7,7 @@
 # 구성 (POC/운영 공통):
 #   Master+Data 겸용 x3 → db_nodes 각 1개씩
 #   JVM 힙: 2GB (POC) → 운영 시 -e os_jvm_heap=16g
-#   스토리지: 100Gi
+#   스토리지: 20Gi
 #   SSL: cert-manager internal-ca-issuer (Transport + HTTP)
 #
 # 운영 구성 (참고):
@@ -69,6 +69,9 @@
     db_node_taint_key: "dedicated"
     db_node_taint_value: "db"
 
+    # local-path-provisioner 데이터 경로
+    local_path_base: "/opt/local-path-provisioner"
+
   tasks:
     # -----------------------------------------------------------------
     # STEP 0. 제거 모드
@@ -94,7 +97,7 @@
         msg: "{{ remove_out.stdout_lines | default([]) }}"
       when: os_action == 'remove'
 
-    - name: "0. [purge] OpenSearch 리소스 + PVC 완전 삭제"
+    - name: "0. [purge] OpenSearch K8s 리소스 + PVC 삭제"
       ansible.builtin.shell: |
         kubectl delete statefulset {{ os_name }} -n {{ os_namespace }} --ignore-not-found=true
         kubectl delete deployment {{ os_name }}-dashboards -n {{ os_namespace }} --ignore-not-found=true
@@ -106,16 +109,64 @@
           -n {{ os_namespace }} --ignore-not-found=true
         kubectl delete certificate {{ os_name }}-transport-cert {{ os_name }}-http-cert \
           -n {{ os_namespace }} --ignore-not-found=true
-        sleep 3
+        sleep 5
         kubectl delete pvc -n {{ os_namespace }} -l app={{ os_name }} --ignore-not-found=true
-        echo "완전 삭제 완료"
+        echo "K8s 리소스 삭제 완료"
       when: os_action == 'purge'
       register: purge_out
       changed_when: true
 
-    - name: "0. [purge] 완전 삭제 결과"
+    - name: "0. [purge] K8s 삭제 결과"
       ansible.builtin.debug:
         msg: "{{ purge_out.stdout_lines | default([]) }}"
+      when: os_action == 'purge'
+
+    - name: "0. [purge] Pod 완전 종료 대기"
+      ansible.builtin.shell: |
+        for i in $(seq 1 30); do
+          COUNT=$(kubectl get pods -n {{ os_namespace }} -l app={{ os_name }} \
+            --no-headers 2>/dev/null | wc -l)
+          [ "$COUNT" -eq 0 ] && echo "Pod 종료 완료" && exit 0
+          echo "대기 중... (${COUNT}개 남음)"
+          sleep 5
+        done
+        echo "경고: Pod 종료 타임아웃"
+      when: os_action == 'purge'
+      register: pod_wait
+      changed_when: false
+
+    - name: "0. [purge] db 노드 로컬 데이터 삭제 (local-path-provisioner)"
+      ansible.builtin.shell: |
+        ssh -i {{ ansible_ssh_private_key_file }} \
+          -o StrictHostKeyChecking=no \
+          -o UserKnownHostsFile=/dev/null \
+          ubuntu@{{ hostvars[item].ansible_host }} \
+          "sudo rm -rf {{ local_path_base }}/pvc-*_{{ os_namespace }}_data-{{ os_name }}-* && echo '{{ item }} ({{ hostvars[item].ansible_host }}): 삭제 완료'"
+      loop: "{{ groups['db_nodes'] }}"
+      when: os_action == 'purge'
+      register: node_purge
+      changed_when: true
+
+    - name: "0. [purge] 노드 데이터 삭제 결과"
+      ansible.builtin.debug:
+        msg: "{{ node_purge.results | map(attribute='stdout') | list }}"
+      when: os_action == 'purge'
+
+    - name: "0. [purge] 노드 데이터 삭제 확인"
+      ansible.builtin.shell: |
+        ssh -i {{ ansible_ssh_private_key_file }} \
+          -o StrictHostKeyChecking=no \
+          -o UserKnownHostsFile=/dev/null \
+          ubuntu@{{ hostvars[item].ansible_host }} \
+          "sudo ls {{ local_path_base }}/ | grep '{{ os_name }}' || echo '{{ item }}: 데이터 없음 (정상)'"
+      loop: "{{ groups['db_nodes'] }}"
+      when: os_action == 'purge'
+      register: node_check
+      changed_when: false
+
+    - name: "0. [purge] 노드 확인 결과"
+      ansible.builtin.debug:
+        msg: "{{ node_check.results | map(attribute='stdout') | list }}"
       when: os_action == 'purge'
 
     - name: "0. 제거/삭제 완료 후 종료"
@@ -426,10 +477,17 @@
                     image: {{ os_image }}
                     securityContext:
                       runAsUser: 0
+                    env:
+                      - name: OPENSEARCH_INITIAL_ADMIN_PASSWORD
+                        valueFrom:
+                          secretKeyRef:
+                            name: {{ os_name }}-auth
+                            key: admin-password
                     command:
                       - sh
                       - -c
                       - |
+                        set -e
                         # 1. data 디렉토리 권한
                         chown -R 1000:1000 /usr/share/opensearch/data
                         # 2. 기존 OpenSearch 기본 config 파일 전체 보존
@@ -444,7 +502,16 @@
                         cp /secret-http/tls.crt /config/http-tls.crt
                         cp /secret-http/tls.key /config/http-tls.key
                         cp /secret-http/ca.crt  /config/http-ca.crt
-                        # 5. 권한 설정
+                        # 5. admin 패스워드 해시 생성 후 internal_users.yml 주입
+                        echo "=== admin 패스워드 해시 생성 중 ==="
+                        HASH=$(/usr/share/opensearch/plugins/opensearch-security/tools/hash.sh \
+                          -p "${OPENSEARCH_INITIAL_ADMIN_PASSWORD}" | tail -1)
+                        echo "해시 생성 완료: ${HASH:0:20}..."
+                        sed -i "s|hash: \".*\"|hash: \"${HASH}\"|" \
+                          /config/opensearch-security/internal_users.yml
+                        echo "=== admin 해시 주입 확인 ==="
+                        grep -A2 "^admin:" /config/opensearch-security/internal_users.yml
+                        # 6. 권한 설정
                         chown -R 1000:1000 /config
                         chmod 640 /config/*.crt /config/*.key
                         echo "=== config 파일 목록 ==="
@@ -469,6 +536,7 @@
                     securityContext:
                       privileged: true
                     command: ["sh", "-c", "sysctl -w vm.max_map_count=262144"]
+
                 containers:
                   - name: opensearch
                     image: {{ os_image }}
@@ -704,7 +772,7 @@
         lines = corefile.splitlines(True)
         insert_at = None
         for i, l in enumerate(lines):
-            if "rewrite name exact" in l and base_domain in l:
+            if "rewrite name exact" in l and "{{ base_domain }}" in l:
                 insert_at = i + 1
 
         if insert_at is None:
@@ -749,7 +817,7 @@
       ansible.builtin.shell: |
         kubectl exec -n {{ os_namespace }} {{ os_name }}-0 -- \
           curl -sk https://localhost:9200/_cluster/health?pretty \
-          -u admin:{{ os_admin_password }} 2>/dev/null || echo "검증 실패"
+          -u "admin:{{ os_admin_password }}" 2>/dev/null || echo "검증 실패"
       register: cluster_health
       changed_when: false
       failed_when: false

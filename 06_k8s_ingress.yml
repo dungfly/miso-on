@@ -7,7 +7,7 @@
   vars:
     harbor_ip: "{{ hostvars[groups['harbor'][0]]['ansible_host'] }}"
     monitor_ip: "{{ hostvars[groups['monitoring'][0]]['ansible_host'] }}"
-    ingress_version: "controller-v1.10.1" # v1.30 호환 버전
+    ingress_version: "controller-v1.10.1"
 
   tasks:
     - name: "Ingress-Nginx 네임스페이스 존재 여부 확인"
@@ -16,9 +16,22 @@
       failed_when: false
       changed_when: false
 
+    - name: "ingress-nginx manifest 다운로드"
+      ansible.builtin.shell: |
+        curl -fsSL -o /tmp/ingress-nginx.yaml \
+          http://{{ harbor_ip }}:8080/manifests/ingress-nginx.yaml
+      when: ns_check.rc != 0
+
+    - name: "ingress-nginx image Harbor 경로로 rewrite"
+      ansible.builtin.shell: |
+        sed -i 's|registry.k8s.io/ingress-nginx/controller:v1.10.1|{{ harbor_domain }}/{{ harbor_project }}/ingress-nginx-controller:v1.10.1|g' /tmp/ingress-nginx.yaml
+        sed -i 's|registry.k8s.io/ingress-nginx/kube-webhook-certgen:v1.4.1|{{ harbor_domain }}/{{ harbor_project }}/ingress-nginx-kube-webhook-certgen:v1.4.1|g' /tmp/ingress-nginx.yaml
+        sed -i 's|@sha256:[a-f0-9]*||g' /tmp/ingress-nginx.yaml
+      when: ns_check.rc != 0
+
     - name: "Bare-metal용 Nginx Ingress manifest 적용"
       ansible.builtin.shell: |
-        kubectl apply -f http://{{ harbor_ip }}:8080/manifests/ingress-nginx.yaml --validate=false
+        kubectl apply -f /tmp/ingress-nginx.yaml --validate=false
       when: ns_check.rc != 0
 
     - name: "Ingress Controller 서비스의 NodePort를 30080, 30443으로 고정"

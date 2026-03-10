@@ -55,9 +55,86 @@
         regexp: 'SystemdCgroup = false'
         replace: 'SystemdCgroup = true'
 
+    - name: "6-b. sandbox_image를 Harbor pause:3.9로 변경"
+      ansible.builtin.replace:
+        path: /etc/containerd/config.toml
+        regexp: 'sandbox_image = ".*"'
+        replace: 'sandbox_image = "{{ harbor_domain }}/{{ harbor_project }}/pause:3.9"'
+
+    - name: "Harbor /etc/hosts 등록"
+      ansible.builtin.lineinfile:
+        path: /etc/hosts
+        regexp: "harbor.{{ base_domain }}$"
+        line: "{{ harbor_ip }} harbor.{{ base_domain }}"
+        state: present
+
+    - name: "containerd certs.d 디렉토리 생성"
+      ansible.builtin.file:
+        path: "/etc/containerd/certs.d/{{ item }}"
+        state: directory
+        mode: "0755"
+      loop:
+        - "{{ harbor_domain }}"
+        - "registry.k8s.io"
+        - "docker.io"
+        - "quay.io"
+
+    - name: "Harbor mirror hosts.toml 설정 (인증 포함)"
+      ansible.builtin.copy:
+        dest: "/etc/containerd/certs.d/{{ harbor_domain }}/hosts.toml"
+        mode: "0600"
+        content: |
+          server = "https://{{ harbor_domain }}"
+          [host."https://{{ harbor_domain }}"]
+            capabilities = ["pull", "resolve"]
+            skip_verify = true
+          [host."https://{{ harbor_domain }}".header]
+            Authorization = ["Basic {{ (harbor_robot_user + ':' + harbor_robot_pass) | b64encode }}"]
+
+    - name: "registry.k8s.io → Harbor mirror 설정"
+      ansible.builtin.copy:
+        dest: /etc/containerd/certs.d/registry.k8s.io/hosts.toml
+        mode: "0600"
+        content: |
+          server = "https://registry.k8s.io"
+          [host."https://{{ harbor_domain }}"]
+            capabilities = ["pull", "resolve"]
+            skip_verify = true
+          [host."https://{{ harbor_domain }}".header]
+            Authorization = ["Basic {{ (harbor_robot_user + ':' + harbor_robot_pass) | b64encode }}"]
+
+    - name: "docker.io → Harbor mirror 설정"
+      ansible.builtin.copy:
+        dest: /etc/containerd/certs.d/docker.io/hosts.toml
+        mode: "0600"
+        content: |
+          server = "https://docker.io"
+          [host."https://{{ harbor_domain }}"]
+            capabilities = ["pull", "resolve"]
+            skip_verify = true
+          [host."https://{{ harbor_domain }}".header]
+            Authorization = ["Basic {{ (harbor_robot_user + ':' + harbor_robot_pass) | b64encode }}"]
+
+    - name: "quay.io → Harbor mirror 설정"
+      ansible.builtin.copy:
+        dest: /etc/containerd/certs.d/quay.io/hosts.toml
+        mode: "0600"
+        content: |
+          server = "https://quay.io"
+          [host."https://{{ harbor_domain }}"]
+            capabilities = ["pull", "resolve"]
+            skip_verify = true
+          [host."https://{{ harbor_domain }}".header]
+            Authorization = ["Basic {{ (harbor_robot_user + ':' + harbor_robot_pass) | b64encode }}"]
+
+    - name: "containerd config_path 설정 (hosts.toml 활성화)"
+      ansible.builtin.replace:
+        path: /etc/containerd/config.toml
+        regexp: 'config_path = ""'
+        replace: 'config_path = "/etc/containerd/certs.d"'
+      ignore_errors: yes
+
     - name: 7. Containerd 즉시 재시작 및 활성화
-      # 핸들러(handler)로 처리하면 플레이 끝에 실행되어
-      # kubeadm init 전에 설정이 반영되지 않으므로 여기서 즉시 재시작합니다.
       ansible.builtin.systemd:
         name: containerd
         state: restarted
@@ -123,6 +200,7 @@
         --pod-network-cidr={{ pod_cidr }}
         --control-plane-endpoint="{{ api_endpoint }}:6443"
         --upload-certs
+        --image-repository {{ harbor_domain }}/{{ harbor_project }}
       when: inventory_hostname == 'master1'
       args:
         creates: /etc/kubernetes/admin.conf
@@ -147,8 +225,7 @@
       when: inventory_hostname == 'master1'
 
     # ---------------------------------------------------------------
-    # STEP 4-b. bastion(Ansible 실행 호스트)에서 kubectl용 kubeconfig 준비
-    # - master1의 admin.conf를 bastion으로 가져오고, server를 HAProxy(api_endpoint)로 고정
+    # STEP 4-b. bastion에서 kubectl용 kubeconfig 준비
     # ---------------------------------------------------------------
     - name: 17-b. master1 admin.conf를 bastion으로 fetch (master1 Only)
       fetch:
@@ -172,48 +249,34 @@
       become: false
       command: kubectl version --client=true
 
-    - name: 17-e. bastion kubeconfig로 cluster-info 확인 (run_once)
+    - name: 17-e. bastion kubeconfig로 노드 확인 (run_once)
       delegate_to: localhost
       run_once: true
       become: false
       environment:
         KUBECONFIG: /tmp/kubeconfig-admin.conf
-      command: kubectl cluster-info
-
+      command: kubectl get nodes
+      failed_when: false
 
     # ---------------------------------------------------------------
-    # STEP 5. 조인 정보 추출 (master1) - hostvars 방식으로 공유
+    # STEP 5. 조인 정보 추출 (master1) - /etc/kubernetes/admin.conf 직접 사용
     # ---------------------------------------------------------------
-    - name: 18-a. 로컬 직접 통신용 kubeconfig 생성 (master1 Only)
-      shell: |
-        cp /etc/kubernetes/admin.conf /tmp/admin-local.conf
-        sed -i 's|server: https://{{ api_endpoint }}:6443|server: https://{{ ansible_default_ipv4.address }}:6443|g' \
-          /tmp/admin-local.conf
-      when: inventory_hostname == 'master1'
-
     - name: 18-b. 조인 커맨드 추출 (master1 Only)
-      shell: |
-        kubeadm token create --print-join-command \
-          --kubeconfig /tmp/admin-local.conf
+      shell: kubeadm token create --print-join-command
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
       register: join_cmd
       when: inventory_hostname == 'master1'
 
     - name: 18-c. 인증서 키 추출 (master1 Only)
-      shell: |
-        kubeadm init phase upload-certs --upload-certs \
-          --kubeconfig /tmp/admin-local.conf | tail -n 1
+      shell: kubeadm init phase upload-certs --upload-certs | tail -n 1
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
       register: cert_key
-      when: inventory_hostname == 'master1'
-
-    - name: 18-d. 임시 kubeconfig 삭제 (master1 Only)
-      file:
-        path: /tmp/admin-local.conf
-        state: absent
       when: inventory_hostname == 'master1'
 
     # ---------------------------------------------------------------
     # STEP 6. master2, 3 조인
-    # hostvars['master1']로 직접 참조 → delegate_facts 불필요
     # ---------------------------------------------------------------
     - name: 20. 마스터 조인 (master2, 3)
       command: >
@@ -223,30 +286,108 @@
       when: inventory_hostname in ['master2', 'master3']
       args:
         creates: /etc/kubernetes/admin.conf
+
     # ---------------------------------------------------------------
     # STEP 7. CNI 설치 (bastion에서 실행)
-    # - kubectl은 bastion(Ansible 실행 호스트)에서 수행
-    # - API 접속은 HAProxy(api_endpoint)로 고정된 kubeconfig 사용
+    # - upstream registry mirror에 의존하지 않고
+    # - Harbor에 수집된 오프라인 이미지 경로로 manifest rewrite 후 적용
     # ---------------------------------------------------------------
-    - name: 21. Calico tigera-operator 설치 (bastion run_once)
+    - name: 21. tigera-operator manifest 다운로드 (bastion run_once)
       delegate_to: localhost
       run_once: true
       become: false
-      environment:
-        KUBECONFIG: /tmp/kubeconfig-admin.conf
       shell: |
-        kubectl apply --server-side --force-conflicts           -f https://raw.githubusercontent.com/projectcalico/calico/v3.27.0/manifests/tigera-operator.yaml           --validate=false
+        set -e
+        curl -fsSL -o /tmp/tigera-operator.yaml \
+          http://{{ harbor_ip }}:8080/manifests/tigera-operator.yaml
 
-    - name: 22. Calico custom-resources 다운로드 및 CIDR 적용 (bastion run_once)
+    - name: 21-b. tigera-operator image를 Harbor 경로로 rewrite (bastion run_once)
+      delegate_to: localhost
+      run_once: true
+      become: false
+      shell: |
+        set -e
+        sed -i 's|quay.io/tigera/operator:v1.32.3|{{ harbor_domain }}/{{ harbor_project }}/tigera-operator:v1.32.3|g' \
+          /tmp/tigera-operator.yaml
+
+    - name: 21-c. tigera-operator 설치 (bastion run_once)
       delegate_to: localhost
       run_once: true
       become: false
       environment:
         KUBECONFIG: /tmp/kubeconfig-admin.conf
       shell: |
-        curl -L -o /tmp/custom-resources.yaml           https://raw.githubusercontent.com/projectcalico/calico/v3.27.0/manifests/custom-resources.yaml
-        sed -i "s|cidr: 192.168.0.0/16|cidr: {{ pod_cidr }}|g" /tmp/custom-resources.yaml
-        sed -i "s|encapsulation: VXLANCrossSubnet|encapsulation: VXLAN|g" /tmp/custom-resources.yaml
+        kubectl apply --server-side --force-conflicts -f /tmp/tigera-operator.yaml --validate=false
+
+    - name: 21-d. tigera-operator Pod Ready 대기 (bastion run_once)
+      delegate_to: localhost
+      run_once: true
+      become: false
+      environment:
+        KUBECONFIG: /tmp/kubeconfig-admin.conf
+      shell: |
+        kubectl -n tigera-operator rollout status deployment/tigera-operator --timeout=300s
+      retries: 5
+      delay: 10
+      register: tigera_wait
+      until: tigera_wait.rc == 0
+      changed_when: false
+
+    - name: 21-e. Installation CRD 등록 대기 (bastion run_once)
+      delegate_to: localhost
+      run_once: true
+      become: false
+      environment:
+        KUBECONFIG: /tmp/kubeconfig-admin.conf
+      shell: |
+        kubectl get crd installations.operator.tigera.io
+      retries: 20
+      delay: 10
+      register: crd_wait
+      until: crd_wait.rc == 0
+      changed_when: false
+
+    - name: 22. Calico Installation CR 생성 (registry 방식, bastion run_once)
+      # tigera-operator의 Installation CR에 registry/imagePath/imagePrefix를 지정하면
+      # operator가 모든 calico 이미지를 Harbor에서 자동으로 pull함.
+      # 이미지 경로: {registry}/{imagePath}/{imagePrefix}{imageName}:{tag}
+      # = harbor.miso.local / miso / calico- / node:v3.27.0
+      # = harbor.miso.local/miso/calico-node:v3.27.0
+      delegate_to: localhost
+      run_once: true
+      become: false
+      ansible.builtin.copy:
+        dest: /tmp/custom-resources.yaml
+        content: |
+          apiVersion: operator.tigera.io/v1
+          kind: Installation
+          metadata:
+            name: default
+          spec:
+            registry: {{ harbor_domain }}
+            imagePath: {{ harbor_project }}
+            imagePrefix: "calico-"
+            calicoNetwork:
+              ipPools:
+              - blockSize: 26
+                cidr: {{ pod_cidr }}
+                encapsulation: VXLAN
+                natOutgoing: Enabled
+                nodeSelector: all()
+          ---
+          apiVersion: operator.tigera.io/v1
+          kind: APIServer
+          metadata:
+            name: default
+          spec: {}
+
+    - name: 22-c. Calico custom-resources 적용 (bastion run_once)
+      delegate_to: localhost
+      run_once: true
+      become: false
+      environment:
+        KUBECONFIG: /tmp/kubeconfig-admin.conf
+      shell: |
         kubectl apply -f /tmp/custom-resources.yaml --validate=false
 
     - name: 23. 노드/파드 상태 확인 (bastion run_once)

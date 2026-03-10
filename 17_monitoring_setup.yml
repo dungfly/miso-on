@@ -1,4 +1,10 @@
 ---
+# harbor facts 를 먼저 수집해서 hostvars 에 로드
+- name: "Harbor facts 수집"
+  hosts: harbor
+  gather_facts: yes
+  tasks: []
+
 # =================================================================
 # 17_monitoring_setup.yml
 # Prometheus + Grafana + AlertManager + Loki (Docker Compose)
@@ -24,7 +30,6 @@
     monitoring_base_dir: "/opt/monitoring"
     monitoring_data_dir: "/data/monitoring"
 
-    grafana_admin_password: "{{ grafana_admin_password }}"
     grafana_hostname: "{{ monitor_domain }}"
 
     # 수집 대상 K8s 노드 목록 (hosts.ini 기반 자동 생성)
@@ -38,8 +43,8 @@
       - { name: "db1",      ip: "10.1.4.10" }
       - { name: "db2",      ip: "10.1.4.20" }
       - { name: "db3",      ip: "10.1.4.30" }
-      - { name: "harbor1",  ip: "{{ hostvars['harbor1']['ansible_host'] }}" }
-      - { name: "monitor1", ip: "{{ hostvars['monitor1']['ansible_host'] }}" }
+      - { name: "harbor1",  ip: "{{ hostvars['harbor1']['ansible_host'] | default(harbor_ip) }}" }
+      - { name: "monitor1", ip: "{{ hostvars['monitor1']['ansible_host'] | default(monitor_ip) }}" }
 
   tasks:
     # ---------------------------------------------------------------
@@ -148,33 +153,30 @@
             # 전체 노드 node-exporter
             - job_name: 'node-exporter'
               static_configs:
-                - targets:
-                  {% for node in k8s_nodes %}
-                  - '{{ node.ip }}:9100'
-                  {% endfor %}
+                - targets: [{% for node in k8s_nodes %}'{{ node.ip }}:9100'{% if not loop.last %},{% endif %}{% endfor %}]
                   labels:
                     env: 'miso'
 
             # Harbor
             - job_name: 'harbor'
               static_configs:
-                - targets: ['{{ hostvars[groups[''harbor''][0]][''ansible_host''] }}:9090']
+                - targets: ['{{ harbor_ip }}:9090']
               metrics_path: /metrics
 
             # PostgreSQL (CNPG exporter)
             - job_name: 'postgresql'
               static_configs:
-                - targets: ['10.1.1.10:9187']
+                - targets: ['{{ api_endpoint }}:9187']
 
             # Redis
             - job_name: 'redis'
               static_configs:
-                - targets: ['10.1.1.10:9121']
+                - targets: ['{{ api_endpoint }}:9121']
 
             # MinIO
             - job_name: 'minio'
               static_configs:
-                - targets: ['10.1.1.10:9000']
+                - targets: ['{{ api_endpoint }}:9000']
               metrics_path: /minio/v2/metrics/cluster
 
     - name: "2-b. AlertManager 설정"
@@ -368,6 +370,8 @@
                 - GF_SECURITY_ADMIN_PASSWORD={{ grafana_admin_password }}
                 - GF_USERS_ALLOW_SIGN_UP=false
                 - GF_SERVER_DOMAIN={{ grafana_hostname }}
+                - GF_SERVER_ROOT_URL=https://{{ grafana_hostname }}
+                - GF_SERVER_SERVE_FROM_SUB_PATH=false
               volumes:
                 - grafana_data:/var/lib/grafana
                 - {{ monitoring_base_dir }}/grafana/provisioning:/etc/grafana/provisioning
@@ -431,9 +435,17 @@
       changed_when: false
       no_log: true
 
+    - name: "5-a. 고아 컨테이너 정리 (docker run 으로 생성된 것 포함)"
+      ansible.builtin.shell: |
+        for name in node-exporter prometheus grafana alertmanager loki; do
+          docker rm -f "$name" 2>/dev/null || true
+        done
+      changed_when: false
+
     - name: "5. 모니터링 스택 기동"
       ansible.builtin.shell: |
         cd {{ monitoring_base_dir }}
+        docker compose down --remove-orphans 2>/dev/null || true
         docker compose up -d
       changed_when: true
 

@@ -61,7 +61,7 @@
   vars:
     minio_namespace: "default"
     minio_replicas: 3
-    minio_image: "{{ image_prefix }}/minio:latest"
+    minio_image: "{{ image_prefix }}/minio:RELEASE.2024-11-07T00-52-20Z"
     minio_storageclass: "local-path"
     minio_storage_size: "20Gi"
     minio_s3_host: "{{ minio_s3_domain }}"         # 내부 DNS rewrite 전용 (Ingress 없음)
@@ -80,10 +80,35 @@
 
     # 자격증명 (Secret으로 분리 - 플레이북에는 초기값만)
     # 운영 환경에서는 Ansible Vault 또는 외부 Secret Manager 사용 권장
-    minio_root_user: "{{ minio_root_user }}"
-    minio_root_password: "{{ minio_root_password }}"
 
   tasks:
+    # -----------------------------------------------------------------
+    # STEP 0. local-path helperImage Harbor로 사전 보장
+    # -----------------------------------------------------------------
+    - name: "0. local-path ConfigMap helperImage Harbor로 보장"
+      ansible.builtin.shell: |
+        TARGET="{{ harbor_domain }}/{{ harbor_project }}/busybox:latest"
+        CURRENT=$(kubectl get configmap local-path-config -n local-path-storage \
+          -o jsonpath='{.data.config\.json}' 2>/dev/null | \
+          grep -o '"helperImage":"[^"]*"' | cut -d'"' -f4)
+        if [ "$CURRENT" = "$TARGET" ]; then
+          echo "already set"
+          exit 0
+        fi
+        kubectl patch configmap local-path-config -n local-path-storage \
+          --type merge \
+          -p '{"data":{"config.json":"{\"nodePathMap\":[{\"node\":\"DEFAULT_PATH_FOR_NON_LISTED_NODES\",\"paths\":[\"\/opt\/local-path-provisioner\"]}],\"helperImage\":\"'$TARGET'\"}"}}' 
+        echo "patched"
+      register: helper_patch
+      changed_when: "'patched' in helper_patch.stdout"
+      failed_when: false
+
+    - name: "0-b. local-path provisioner 재시작 (helperImage 변경 시)"
+      ansible.builtin.shell: |
+        kubectl rollout restart deployment -n local-path-storage local-path-provisioner
+        kubectl rollout status deployment -n local-path-storage local-path-provisioner --timeout=60s
+      when: helper_patch.changed
+
     # -----------------------------------------------------------------
     # STEP 1. 기존 리소스 존재 여부 확인
     # -----------------------------------------------------------------

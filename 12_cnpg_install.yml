@@ -8,8 +8,8 @@
   vars:
     harbor_ip: "{{ hostvars[groups['harbor'][0]]['ansible_host'] }}"
     monitor_ip: "{{ hostvars[groups['monitoring'][0]]['ansible_host'] }}"
-    cnpg_manifest_src: "./cnpg-1.22.1.yaml"     # 컨트롤 머신(레포)에 있는 파일
-    cnpg_manifest_dest: "/tmp/cnpg-1.22.1.yaml" # bastion에 둘 위치
+    cnpg_manifest_src: "./cnpg-1.22.1.yaml"
+    cnpg_manifest_dest: "/tmp/cnpg-1.22.1.yaml"
 
     allow_online_download: true
     cnpg_manifest_url: "http://{{ harbor_ip }}:8080/manifests/cnpg-1.22.1.yaml"
@@ -30,19 +30,37 @@
         mode: "0644"
       when: cnpg_local.stat.exists
 
-    - name: "Download CNPG manifest to bastion (online mode - optional)"
+    - name: "Download CNPG manifest to bastion (Harbor)"
       ansible.builtin.get_url:
         url: "{{ cnpg_manifest_url }}"
         dest: "{{ cnpg_manifest_dest }}"
         mode: "0644"
       when: (not cnpg_local.stat.exists) and allow_online_download
 
-    - name: "Fail if CNPG manifest not available (offline and no local file)"
+    - name: "Fail if CNPG manifest not available"
       ansible.builtin.fail:
         msg: >
           CNPG manifest not found on controller: {{ cnpg_manifest_src }}
           and online download is disabled/unavailable.
       when: (not cnpg_local.stat.exists) and (not allow_online_download)
+
+    - name: "CNPG image Harbor 경로로 rewrite"
+      ansible.builtin.shell: |
+        sed -i 's|ghcr.io/cloudnative-pg/cloudnative-pg:1.22.1|{{ harbor_domain }}/{{ harbor_project }}/cnpg:1.22.1|g' {{ cnpg_manifest_dest }}
+        sed -i 's|@sha256:[a-f0-9]*||g' {{ cnpg_manifest_dest }}
+
+    - name: "rewrite 결과 검증"
+      ansible.builtin.shell: |
+        echo "=== ghcr.io 잔여 확인 (0이어야 정상) ==="
+        grep -c "ghcr.io/cloudnative-pg" {{ cnpg_manifest_dest }} || true
+        echo "=== harbor 경로 확인 ==="
+        grep "image:" {{ cnpg_manifest_dest }} | sort -u
+      register: rewrite_check
+      changed_when: false
+
+    - name: "rewrite 결과 출력"
+      ansible.builtin.debug:
+        msg: "{{ rewrite_check.stdout_lines }}"
 
     - name: "Apply CNPG operator manifest (server-side)"
       ansible.builtin.shell: |

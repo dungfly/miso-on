@@ -151,7 +151,7 @@ INSTALLER_DEST="${HOME}/harbor-offline-installer-${HARBOR_VERSION}.tgz"
 
 if [ -f "${INSTALLER_TGZ}" ]; then
   echo "  로컬 installer 사용"
-  cp "${INSTALLER_TGZ}" "${INSTALLER_DEST}"
+  [ "${INSTALLER_TGZ}" != "${INSTALLER_DEST}" ] && cp "${INSTALLER_TGZ}" "${INSTALLER_DEST}" || true
 else
   echo "  installer 다운로드 중..."
   curl -fL \
@@ -221,6 +221,81 @@ elif [ "${HTTP_STATUS}" = "409" ]; then
   echo "  ✓ miso 프로젝트 이미 존재"
 else
   echo "  ✗ 프로젝트 생성 실패 (HTTP ${HTTP_STATUS})"
+fi
+
+# =================================================================
+# STEP 5-b. Robot Account 생성 (pull 전용 - 노드 배포용)
+# =================================================================
+echo ""
+echo ">>> [5-b] Harbor Robot Account 생성 (pull 전용)"
+
+ROBOT_NAME="node-pull"
+ROBOT_SECRET_FILE="${SCRIPT_DIR}/harbor-robot-secret.txt"
+
+# Harbor 2.x 시스템 레벨 robot API 사용
+ROBOT_PAYLOAD=$(cat <<EOF
+{
+  "name": "${ROBOT_NAME}",
+  "description": "Pull-only robot for K8s nodes",
+  "duration": -1,
+  "level": "project",
+  "permissions": [
+    {
+      "kind": "project",
+      "namespace": "miso",
+      "access": [
+        {"resource": "repository", "action": "pull"}
+      ]
+    }
+  ]
+}
+EOF
+)
+
+ROBOT_RESP=$(curl -sk -w "\n%{http_code}" \
+  -X POST "https://${HARBOR_IP}/api/v2.0/robots" \
+  -u "admin:${HARBOR_ADMIN_PASSWORD}" \
+  -H "Content-Type: application/json" \
+  -d "${ROBOT_PAYLOAD}")
+
+HTTP_STATUS=$(echo "${ROBOT_RESP}" | tail -1)
+ROBOT_BODY=$(echo "${ROBOT_RESP}" | sed '$d')
+
+if [ "${HTTP_STATUS}" = "201" ]; then
+  ROBOT_SECRET=$(echo "${ROBOT_BODY}" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['secret'])")
+  ROBOT_USER=$(echo "${ROBOT_BODY}" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['name'])")
+  echo "${ROBOT_USER}:${ROBOT_SECRET}" > "${ROBOT_SECRET_FILE}"
+  chmod 600 "${ROBOT_SECRET_FILE}"
+  echo "  ✓ Robot account 생성: ${ROBOT_USER}"
+  echo "  ✓ Secret 저장: ${ROBOT_SECRET_FILE}"
+elif [ "${HTTP_STATUS}" = "409" ]; then
+  echo "  ✓ Robot account 이미 존재 - 재생성"
+  # 기존 삭제 후 재생성
+  ROBOT_ID=$(curl -sk "https://${HARBOR_IP}/api/v2.0/robots?q=name%3D%24miso%2B${ROBOT_NAME}" \
+    -u "admin:${HARBOR_ADMIN_PASSWORD}" | python3 -c "import sys,json; r=json.load(sys.stdin); print(r[0]['id']) if r else print('')")
+  if [ -n "${ROBOT_ID}" ]; then
+    curl -sk -X DELETE "https://${HARBOR_IP}/api/v2.0/robots/${ROBOT_ID}" \
+      -u "admin:${HARBOR_ADMIN_PASSWORD}" > /dev/null
+    # 재귀 없이 재실행 - 잠시 대기 후 다시 호출
+    sleep 2
+    ROBOT_RESP2=$(curl -sk -w "\n%{http_code}" \
+      -X POST "https://${HARBOR_IP}/api/v2.0/robots" \
+      -u "admin:${HARBOR_ADMIN_PASSWORD}" \
+      -H "Content-Type: application/json" \
+      -d "${ROBOT_PAYLOAD}")
+    HTTP_STATUS2=$(echo "${ROBOT_RESP2}" | tail -1)
+    ROBOT_BODY2=$(echo "${ROBOT_RESP2}" | sed '$d')
+    if [ "${HTTP_STATUS2}" = "201" ]; then
+      ROBOT_SECRET=$(echo "${ROBOT_BODY2}" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['secret'])")
+      ROBOT_USER=$(echo "${ROBOT_BODY2}" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['name'])")
+      echo "${ROBOT_USER}:${ROBOT_SECRET}" > "${ROBOT_SECRET_FILE}"
+      chmod 600 "${ROBOT_SECRET_FILE}"
+      echo "  ✓ Robot account 재생성: ${ROBOT_USER}"
+    fi
+  fi
+else
+  echo "  ✗ Robot account 생성 실패 (HTTP ${HTTP_STATUS})"
+  echo "  응답: ${ROBOT_BODY}"
 fi
 
 # =================================================================

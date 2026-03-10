@@ -16,7 +16,13 @@
         - { regexp: '^#?\$nrconf\{kernelhints\}', line: "$nrconf{kernelhints} = -1;" }
       ignore_errors: yes
 
-    - name: 1. ansible.cfg 생성 (log_path, host_key_checking)
+    - name: 1-a. /etc/ansible 디렉토리 생성
+      ansible.builtin.file:
+        path: /etc/ansible
+        state: directory
+        mode: '0755'
+
+    - name: 1-b. ansible.cfg 생성 (log_path, host_key_checking)
       ansible.builtin.copy:
         dest: /etc/ansible/ansible.cfg
         mode: '0644'
@@ -45,9 +51,12 @@
       register: galaxy_tarballs
       become: false
 
-    - name: 4-b. Ansible 컬렉션 설치 (오프라인 - galaxy/ tarball 우선)
-      ansible.builtin.command: >
-        ansible-galaxy collection install {{ item.path }}
+    - name: 4-b. Ansible 컬렉션 설치 (오프라인 - 로컬 경로로 설치)
+      # ansible 2.10.x: 경로 앞에 ./ 붙이면 galaxy API 호출 없이 로컬 설치
+      ansible.builtin.shell: |
+        ansible-galaxy collection install "./{{ item.path | basename }}"           -p ~/.ansible/collections
+      args:
+        chdir: "{{ item.path | dirname }}"
       loop: "{{ galaxy_tarballs.files }}"
       become: false
       changed_when: true

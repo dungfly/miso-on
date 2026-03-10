@@ -17,8 +17,32 @@
       failed_when: ns_out.rc != 0 and ("AlreadyExists" not in (ns_out.stderr | default("")))
       changed_when: ns_out.rc == 0
 
-    - name: 2. Cert-manager 매니페스트 적용 (CRD 포함)
-      shell: kubectl apply -f {{ cert_manager_url }} --validate=false
+    - name: 2. Cert-manager manifest 다운로드
+      ansible.builtin.shell: |
+        curl -fsSL -o /tmp/cert-manager.yaml {{ cert_manager_url }}
+
+    - name: 2-b. Cert-manager image Harbor 경로로 rewrite
+      ansible.builtin.shell: |
+        sed -i 's|quay.io/jetstack/cert-manager-controller:v1.14.4|{{ harbor_domain }}/{{ harbor_project }}/cert-manager-controller:v1.14.4|g' /tmp/cert-manager.yaml
+        sed -i 's|quay.io/jetstack/cert-manager-webhook:v1.14.4|{{ harbor_domain }}/{{ harbor_project }}/cert-manager-webhook:v1.14.4|g' /tmp/cert-manager.yaml
+        sed -i 's|quay.io/jetstack/cert-manager-cainjector:v1.14.4|{{ harbor_domain }}/{{ harbor_project }}/cert-manager-cainjector:v1.14.4|g' /tmp/cert-manager.yaml
+        sed -i 's|@sha256:[a-f0-9]*||g' /tmp/cert-manager.yaml
+
+    - name: 2-c. rewrite 결과 검증
+      ansible.builtin.shell: |
+        echo "=== quay.io 잔여 확인 (0이어야 정상) ==="
+        grep -c "quay.io/jetstack" /tmp/cert-manager.yaml || true
+        echo "=== harbor 경로 확인 ==="
+        grep "image:" /tmp/cert-manager.yaml | grep "cert-manager" | sort -u
+      register: rewrite_check
+      changed_when: false
+
+    - name: 2-d. rewrite 결과 출력
+      ansible.builtin.debug:
+        msg: "{{ rewrite_check.stdout_lines }}"
+
+    - name: 3. Cert-manager 매니페스트 적용 (CRD 포함)
+      shell: kubectl apply -f /tmp/cert-manager.yaml --validate=false
       register: cm_install
       changed_when: "'created' in cm_install.stdout or 'configured' in cm_install.stdout"
 

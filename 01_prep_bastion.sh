@@ -36,7 +36,8 @@ echo ">>> [Bastion] 관리 서버 설정을 시작합니다."
 # =================================================================
 # 1. 패키지 설치 (인터넷 / 폐쇄망 자동 분기)
 # =================================================================
-BASTION_PKGS_COMMON="python3-pip jq curl git vim net-tools htop chrony ca-certificates gnupg"
+# 이미 설치된 패키지 제외 - ansible/kubectl/jq/net-tools 등 없는 것만 설치
+BASTION_PKGS_COMMON="ansible python3-pip jq net-tools"
 HARBOR_REPO="http://10.1.5.10:8080/debs"
 
 # -------------------------------------------------------
@@ -45,30 +46,76 @@ HARBOR_REPO="http://10.1.5.10:8080/debs"
 # -------------------------------------------------------
 echo ">>> [로컬저장소] Harbor nginx 저장소에서 설치합니다."
 
-# Harbor 로컬 저장소 등록
-sudo tee /etc/apt/sources.list.d/miso-local-common.list << APTEOF
-deb [trusted=yes] ${HARBOR_REPO}/common ./
+# Harbor 로컬 저장소 등록 (bastion 전용 - Harbor 서버와 동일 버전)
+sudo tee /etc/apt/sources.list.d/miso-local-bastion.list << APTEOF
+deb [trusted=yes] ${HARBOR_REPO}/bastion ./
 APTEOF
 
 sudo tee /etc/apt/sources.list.d/miso-local-k8s.list << APTEOF
 deb [trusted=yes] ${HARBOR_REPO}/k8s ./
 APTEOF
 
-# 외부 저장소 비활성화
+# [1단계] 외부 저장소 완전 비활성화
 sudo rm -f /etc/apt/sources.list.d/kubernetes.list
+if [ -f /etc/apt/sources.list ] && ! grep -q "^#.*DISABLED" /etc/apt/sources.list; then
+  sudo cp /etc/apt/sources.list /etc/apt/sources.list.bak
+  sudo sed -i 's/^deb /#DISABLED deb /g' /etc/apt/sources.list
+  sudo sed -i 's/^deb-src /#DISABLED deb-src /g' /etc/apt/sources.list
+fi
+for f in /etc/apt/sources.list.d/ubuntu.sources /etc/apt/sources.list.d/*.list; do
+  [ -f "$f" ] || continue
+  case "$f" in
+    *miso-local-bastion*|*miso-local-k8s*) continue ;;
+  esac
+  sudo sed -i 's/^deb /#DISABLED deb /g' "$f" 2>/dev/null || true
+done
 
 sudo apt-get update -qq
-sudo apt-get install -y --no-install-recommends ${BASTION_PKGS_COMMON} kubectl
+
+# 이미 설치된 패키지는 건너뛰고 없는 것만 설치 (버전 충돌 방지)
+PKGS_TO_INSTALL=""
+for pkg in ${BASTION_PKGS_COMMON} kubectl; do
+  # python3-pip은 항상 설치 시도 (pip3 명령 보장)
+  if [ "${pkg}" = "python3-pip" ]; then
+    PKGS_TO_INSTALL="${PKGS_TO_INSTALL} ${pkg}"
+  elif dpkg -l "$pkg" 2>/dev/null | grep -q "^ii"; then
+    echo "  [skip] ${pkg} 이미 설치됨"
+  else
+    PKGS_TO_INSTALL="${PKGS_TO_INSTALL} ${pkg}"
+  fi
+done
+
+if [ -n "${PKGS_TO_INSTALL}" ]; then
+  echo "  설치할 패키지: ${PKGS_TO_INSTALL}"
+  sudo apt-get install -y --no-install-recommends ${PKGS_TO_INSTALL}
+else
+  echo "  모든 패키지 이미 설치됨"
+fi
 
 echo ">>> 패키지 설치 완료"
 kubectl version --client=true
 
 # =================================================================
-# 1-b. pip으로 Ansible 최신버전 설치 (apt ansible은 구버전)
+# 1-b. Ansible 최신버전 pip 설치 (Harbor nginx wheel)
 # =================================================================
-echo ">>> Ansible 최신버전 pip 설치"
-pip3 install --upgrade ansible --break-system-packages
-ansible --version | head -1
+echo ">>> Ansible pip wheel 설치 (Harbor에서)"
+pip3 install ansible   --no-index   --find-links "http://10.1.5.10:8080/debs/pip/"   --trusted-host 10.1.5.10   -q
+echo "  ✓ $(ansible --version | head -1)"
+
+# =================================================================
+# 1-c. Ansible Galaxy 컬렉션 설치 (Harbor nginx tarball)
+# =================================================================
+echo ">>> Ansible Galaxy 컬렉션 설치"
+GALAXY_TMP=$(mktemp -d)
+# Harbor galaxy 디렉토리에서 파일 목록을 가져와 설치
+GALAXY_FILES=$(curl -s "http://10.1.5.10:8080/galaxy/"   | grep -oE '[a-z]+-[a-z_]+-[0-9]+\.[0-9]+\.[0-9]+\.tar\.gz'   | sort -u)
+
+for fname in ${GALAXY_FILES}; do
+  curl -s "http://10.1.5.10:8080/galaxy/${fname}" -o "${GALAXY_TMP}/${fname}"
+  ansible-galaxy collection install "${GALAXY_TMP}/${fname}"     -p ~/.ansible/collections -q 2>/dev/null || true
+  echo "  ✓ ${fname}"
+done
+rm -rf "${GALAXY_TMP}" 
 
 # =================================================================
 # 2. miso-key.pem 설치

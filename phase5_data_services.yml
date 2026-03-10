@@ -13,7 +13,6 @@
 #   OS 재설치      : ansible-playbook -i hosts.ini 15_opensrarch_setup.yml -e force_reinstall=true
 #   OS 제거        : ansible-playbook -i hosts.ini 15_opensrarch_setup.yml -e os_action=remove
 # =================================================================
-- import_playbook: 8.5_coredns_setup.yml
 - import_playbook: 09_minio_setup.yml
 - import_playbook: 12_cnpg_install.yml
 - import_playbook: 13_postgres_cluster.yml
