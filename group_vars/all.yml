@@ -36,12 +36,18 @@ wildcard_secret: "wildcard-tls"
 # -----------------------------------------------------------------------------
 # [3] 패스워드  ★ 설치 전 반드시 변경하세요 ★
 # -----------------------------------------------------------------------------
-harbor_admin_password:     "Harbor12345"
-grafana_admin_password:    "misomonitor"
+# harbor_admin_password:     "Harbor12345"
+# grafana_admin_password:    "misomonitor"
+# minio_root_user:           "misoadmin"
+# minio_root_password:       "misopassword"
+# opensearch_admin_password: "Misoopen!!"
+# redis_password:            "misoredis"
+harbor_admin_password:     "6g@LSyxuY85Q"
+grafana_admin_password:    "@k3Lz5u3g@0E"
 minio_root_user:           "misoadmin"
-minio_root_password:       "misopassword"
-opensearch_admin_password: "Misoopen!!"
-redis_password:            "misoredis"
+minio_root_password:       "9h76@OMqZ@3U"
+opensearch_admin_password: "rGv@74@Z5r5U"
+redis_password:            "5Mwsh@D@kpnX"
 
 # -----------------------------------------------------------------------------
 # [4] Harbor

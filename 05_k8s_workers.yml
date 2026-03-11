@@ -38,116 +38,46 @@
     # ---------------------------------------------------------------
     - name: 4. Containerd 설치
       apt:
-        name: containerd
+        name: containerd.io
         state: present
         update_cache: yes
 
-    - name: 5. Containerd 기본 설정 생성
-      shell: |
+    - name: "5. Containerd 설정 파일 생성 (2.x 호환)"
+      ansible.builtin.copy:
+        dest: /tmp/fix_containerd.py
+        mode: "0755"
+        content: |
+          import re
+          with open("/etc/containerd/config.toml", "r") as f:
+              c = f.read()
+          c = c.replace("SystemdCgroup = false", "SystemdCgroup = true")
+          c = re.sub(r"disabled_plugins\s*=\s*\[[^\]]*\"cri\"[^\]]*\]", "disabled_plugins = []", c)
+          c = re.sub(r'sandbox_image\s*=\s*"[^"]*"', 'sandbox_image = "{{ harbor_domain }}/{{ harbor_project }}/pause:3.9"', c)
+          c = re.sub(r"sandbox\s*=\s*'[^']*'", "sandbox = '{{ harbor_domain }}/{{ harbor_project }}/pause:3.9'", c)
+          c = re.sub(r"^[ \t]*config_path[ \t]*=[^\n]*\n", "", c, flags=re.MULTILINE)
+          if "io.containerd.cri.v1.images" in c:
+              c = re.sub(
+                  r"(\[plugins\.'io\.containerd\.cri\.v1\.images'\.registry\])",
+                  r"\1\n        config_path = '/etc/containerd/certs.d'",
+                  c
+              )
+          else:
+              c = re.sub(
+                  r'(\[plugins\."io\.containerd\.grpc\.v1\.cri"\.registry\])',
+                  r'\1\n        config_path = "/etc/containerd/certs.d"',
+                  c
+              )
+          with open("/etc/containerd/config.toml", "w") as f:
+              f.write(c)
+          print("config.toml updated")
+
+    - name: "5-b. Containerd config.toml 생성 및 최적화 실행"
+      ansible.builtin.shell: |
         set -e
         mkdir -p /etc/containerd
-        containerd config default > /etc/containerd/config.toml
-      args:
-        creates: /etc/containerd/config.toml
-
-    - name: 6. Containerd SystemdCgroup 활성화
-      replace:
-        path: /etc/containerd/config.toml
-        regexp: 'SystemdCgroup = false'
-        replace: 'SystemdCgroup = true'
-    - name: "6-b. containerd sandbox_image를 Harbor pause:3.9로 변경"
-      ansible.builtin.replace:
-        path: /etc/containerd/config.toml
-        regexp: 'sandbox_image = ".*"'
-        replace: 'sandbox_image = "{{ harbor_domain }}/{{ harbor_project }}/pause:3.9"'
-
-
-
-    - name: "Harbor /etc/hosts 등록"
-      ansible.builtin.lineinfile:
-        path: /etc/hosts
-        regexp: "harbor.{{ base_domain }}$"
-        line: "{{ harbor_ip }} harbor.{{ base_domain }}"
-        state: present
-
-    - name: "Harbor mirror hosts.toml 디렉토리 생성"
-      ansible.builtin.file:
-        path: /etc/containerd/certs.d/{{ harbor_domain }}
-        state: directory
-        mode: "0755"
-
-    - name: "Harbor mirror hosts.toml 설정 (인증 포함)"
-      ansible.builtin.copy:
-        dest: /etc/containerd/certs.d/{{ harbor_domain }}/hosts.toml
-        mode: "0600"
-        content: |
-          server = "https://{{ harbor_domain }}"
-          [host."https://{{ harbor_domain }}"]
-            capabilities = ["pull", "resolve"]
-            skip_verify = true
-          [host."https://{{ harbor_domain }}".header]
-            Authorization = ["Basic {{ (harbor_robot_user + ':' + harbor_robot_pass) | b64encode }}"]
-
-
-    - name: "registry.k8s.io mirror 디렉토리 생성"
-      ansible.builtin.file:
-        path: /etc/containerd/certs.d/registry.k8s.io
-        state: directory
-        mode: "0755"
-
-    - name: "registry.k8s.io → Harbor mirror 설정"
-      ansible.builtin.copy:
-        dest: /etc/containerd/certs.d/registry.k8s.io/hosts.toml
-        mode: "0644"
-        content: |
-          server = "https://registry.k8s.io"
-          [host."https://{{ harbor_domain }}"]
-            capabilities = ["pull", "resolve"]
-            skip_verify = true
-          [host."https://{{ harbor_domain }}".header]
-            Authorization = ["Basic {{ (harbor_robot_user + ':' + harbor_robot_pass) | b64encode }}"]
-
-    - name: "docker.io mirror 디렉토리 생성"
-      ansible.builtin.file:
-        path: /etc/containerd/certs.d/docker.io
-        state: directory
-        mode: "0755"
-
-    - name: "docker.io → Harbor mirror 설정"
-      ansible.builtin.copy:
-        dest: /etc/containerd/certs.d/docker.io/hosts.toml
-        mode: "0644"
-        content: |
-          server = "https://docker.io"
-          [host."https://{{ harbor_domain }}"]
-            capabilities = ["pull", "resolve"]
-            skip_verify = true
-          [host."https://{{ harbor_domain }}".header]
-            Authorization = ["Basic {{ (harbor_robot_user + ':' + harbor_robot_pass) | b64encode }}"]
-
-    - name: "quay.io mirror 디렉토리 생성"
-      ansible.builtin.file:
-        path: /etc/containerd/certs.d/quay.io
-        state: directory
-        mode: "0755"
-
-    - name: "quay.io → Harbor mirror 설정"
-      ansible.builtin.copy:
-        dest: /etc/containerd/certs.d/quay.io/hosts.toml
-        mode: "0644"
-        content: |
-          server = "https://quay.io"
-          [host."https://{{ harbor_domain }}"]
-            capabilities = ["pull", "resolve"]
-            skip_verify = true
-          [host."https://{{ harbor_domain }}".header]
-            Authorization = ["Basic {{ (harbor_robot_user + ':' + harbor_robot_pass) | b64encode }}"]
-
-    - name: "containerd config_path 설정 (hosts.toml 활성화)"
-      ansible.builtin.replace:
-        path: /etc/containerd/config.toml
-        regexp: 'config_path = ""'
-        replace: 'config_path = "/etc/containerd/certs.d"'
+        [ -f /etc/containerd/config.toml ] || containerd config default > /etc/containerd/config.toml
+        python3 /tmp/fix_containerd.py
+      changed_when: true
 
     - name: 7. Containerd 즉시 재시작 및 활성화
       ansible.builtin.systemd:

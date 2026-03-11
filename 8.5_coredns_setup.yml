@@ -13,15 +13,15 @@
 #   - rewrite 방식은 .:53 블록 내에서 처리하므로 루프 없음
 #
 # 등록 도메인:
-#   postgres-rw.miso.local → miso-db-rw.default.svc.cluster.local  (Primary)
-#   postgres-ro.miso.local → miso-db-ro.default.svc.cluster.local  (Replica)
-#   s3.miso.local          → minio-internal.default.svc.cluster.local (S3 API)
-#   s3console.miso.local   → minio.default.svc.cluster.local          (Console)
+#   postgres-rw.{{ base_domain }} → miso-db-rw.default.svc.cluster.local  (Primary)
+#   postgres-ro.{{ base_domain }} → miso-db-ro.default.svc.cluster.local  (Replica)
+#   s3.{{ base_domain }}          → minio-internal.default.svc.cluster.local (S3 API)
+#   s3console.{{ base_domain }}   → minio.default.svc.cluster.local          (Console)
 #
 # 외부 접속 전용 (HAProxy → Monitor VM):
-#   monitor.miso.local      → 10.1.5.100 (Grafana)
-#   prometheus.miso.local   → 10.1.5.100 (Prometheus)
-#   alertmanager.miso.local → 10.1.5.100 (AlertManager)
+#   monitor.{{ base_domain }}      → 10.1.5.100 (Grafana)
+#   prometheus.{{ base_domain }}   → 10.1.5.100 (Prometheus)
+#   alertmanager.{{ base_domain }} → 10.1.5.100 (AlertManager)
 #
 # 멱등성: postgres-rw rewrite 라인 존재 여부로 판단 (rc 기반)
 # =================================================================
@@ -41,10 +41,10 @@
     rewrite_rules: |
       # ── miso.local 내부 도메인 (ansible 자동 추가) ─────────────
       # *.miso.local → *.default.svc.cluster.local 로 rewrite
-      rewrite name exact postgres-rw.miso.local miso-db-rw.default.svc.cluster.local
-      rewrite name exact postgres-ro.miso.local miso-db-ro.default.svc.cluster.local
-      rewrite name exact s3.miso.local minio-internal.default.svc.cluster.local
-      rewrite name exact s3console.miso.local minio.default.svc.cluster.local
+      rewrite name exact postgres-rw.{{ base_domain }} miso-db-rw.default.svc.cluster.local
+      rewrite name exact postgres-ro.{{ base_domain }} miso-db-ro.default.svc.cluster.local
+      rewrite name exact s3.{{ base_domain }} minio-internal.default.svc.cluster.local
+      rewrite name exact s3console.{{ base_domain }} minio.default.svc.cluster.local
       # ── 모니터링 (Monitor VM 직접 라우팅) ──────────────────────────
       # HAProxy → 10.1.5.100 nginx → 각 서비스 (CoreDNS hosts 블록으로 처리)
       # ─────────────────────────────────────────────────────────────
@@ -52,9 +52,9 @@
     # Monitor VM 직접 IP 매핑 (K8s Ingress 미경유)
     hosts_rules: |
       # ── 모니터링 외부 접속 도메인 (ansible 자동 추가) ───────────
-      {{ hostvars[groups['monitoring'][0]]['ansible_host'] }} monitor.miso.local
-      {{ hostvars[groups['monitoring'][0]]['ansible_host'] }} prometheus.miso.local
-      {{ hostvars[groups['monitoring'][0]]['ansible_host'] }} alertmanager.miso.local
+      {{ hostvars[groups['monitoring'][0]]['ansible_host'] }} monitor.{{ base_domain }}
+      {{ hostvars[groups['monitoring'][0]]['ansible_host'] }} prometheus.{{ base_domain }}
+      {{ hostvars[groups['monitoring'][0]]['ansible_host'] }} alertmanager.{{ base_domain }}
       # ────────────────────────────────────────────────────────────
 
   tasks:
@@ -139,7 +139,7 @@
         corefile = cm["data"]["Corefile"]
 
         # 안전 체크 (이미 있으면 스킵)
-        if "rewrite name exact postgres-rw.miso.local" in corefile:
+        if "rewrite name exact postgres-rw.{{ base_domain }}" in corefile:
             print("Already patched - skip")
             sys.exit(0)
 
@@ -177,7 +177,7 @@
         # hosts 블록 삽입 또는 기존 블록에 항목 추가
         corefile_str = cm["data"]["Corefile"]
         hosts_insert = """{{ hosts_rules }}"""
-        if "monitor.miso.local" not in corefile_str:
+        if "monitor.{{ base_domain }}" not in corefile_str:
             if re.search(r'hosts\s*\{', corefile_str):
                 # 기존 hosts 블록이 있으면 fallthrough 바로 앞에 항목 추가
                 new_entries = ""
@@ -264,10 +264,10 @@
           -- sh -c "
             echo '--- kubernetes (기본 DNS 확인) ---' &&
             nslookup kubernetes.default.svc.cluster.local &&
-            echo '--- postgres-rw.miso.local ---' &&
-            nslookup postgres-rw.miso.local || true &&
-            echo '--- s3.miso.local ---' &&
-            nslookup s3.miso.local || true
+            echo '--- postgres-rw.{{ base_domain }} ---' &&
+            nslookup postgres-rw.{{ base_domain }} || true &&
+            echo '--- s3.{{ base_domain }} ---' &&
+            nslookup s3.{{ base_domain }} || true
           " 2>/dev/null || true
       register: dns_test
       changed_when: false
@@ -288,15 +288,15 @@
           - "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
           - ""
           - " 내부 Pod에서 사용 가능한 도메인:"
-          - "  postgres-rw.miso.local:5432  → CNPG Primary"
-          - "  postgres-ro.miso.local:5432  → CNPG Replica"
-          - "  s3.miso.local:9000           → MinIO S3 API"
-          - "  s3console.miso.local:9001    → MinIO Console"
+          - "  postgres-rw.{{ base_domain }}:5432  → CNPG Primary"
+          - "  postgres-ro.{{ base_domain }}:5432  → CNPG Replica"
+          - "  s3.{{ base_domain }}:9000           → MinIO S3 API"
+          - "  s3console.{{ base_domain }}:9001    → MinIO Console"
           - ""
           - " 외부 접속 (Ingress, 변경 없음):"
-          - "  s3console.miso.local → HAProxy → Nginx Ingress"
+          - "  s3console.{{ base_domain }} → HAProxy → Nginx Ingress"
           - ""
           - " 향후 추가 시 rewrite_rules 변수에 라인 추가:"
-          - "  rewrite name exact redis.miso.local redis.default.svc.cluster.local"
-          - "  rewrite name exact opensearch.miso.local opensearch-svc.default.svc.cluster.local"
+          - "  rewrite name exact redis.{{ base_domain }} redis.default.svc.cluster.local"
+          - "  rewrite name exact opensearch.{{ base_domain }} opensearch-svc.default.svc.cluster.local"
           - "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"

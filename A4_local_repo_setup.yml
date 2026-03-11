@@ -77,6 +77,13 @@
         content: |
           deb [trusted=yes] {{ mirror_base }}/k8s ./
 
+    - name: "docker 로컬 저장소 등록 (containerd.io 포함)"
+      ansible.builtin.copy:
+        dest: /etc/apt/sources.list.d/miso-local-docker.list
+        mode: "0644"
+        content: |
+          deb [trusted=yes] {{ mirror_base }}/docker ./
+
     - name: "apt 캐시 갱신"
       ansible.builtin.apt:
         update_cache: yes

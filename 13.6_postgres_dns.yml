@@ -4,8 +4,8 @@
 #
 # 목적: PostgreSQL 도메인 접속을 위한 ExternalName Service 등록
 #
-#   postgres-rw.miso.local:5432  →  CNPG Primary  (읽기/쓰기)
-#   postgres-ro.miso.local:5432  →  CNPG Replica  (읽기 전용)
+#   postgres-rw.{{ base_domain }}:5432  →  CNPG Primary  (읽기/쓰기)
+#   postgres-ro.{{ base_domain }}:5432  →  CNPG Replica  (읽기 전용)
 #
 # 선행 조건:
 #   - 08_5_coredns_setup.yml 실행 완료 (miso.local 존 등록)
@@ -14,8 +14,8 @@
 # 이 플레이북의 역할:
 #   CoreDNS 존 등록은 08_5 에서 완료됨.
 #   여기서는 ExternalName Service 만 등록.
-#   → postgres-rw.miso.local → miso-db-rw.default.svc.cluster.local
-#   → postgres-ro.miso.local → miso-db-ro.default.svc.cluster.local
+#   → postgres-rw.{{ base_domain }} → miso-db-rw.default.svc.cluster.local
+#   → postgres-ro.{{ base_domain }} → miso-db-ro.default.svc.cluster.local
 #
 # [ExternalName 을 선택한 이유]
 #   CNPG는 Failover 시 miso-db-rw 서비스의 셀렉터를 자동으로
@@ -44,7 +44,7 @@
       ansible.builtin.shell: |
         kubectl get configmap coredns -n kube-system \
           -o jsonpath='{.data.Corefile}' \
-          | grep -q 'rewrite name exact postgres-rw.miso.local'
+          | grep -q 'rewrite name exact postgres-rw.{{ base_domain }}'
       register: coredns_zone_check
       changed_when: false
       failed_when: coredns_zone_check.rc != 0
@@ -72,7 +72,7 @@
         dest: /tmp/postgres-alias-svc.yaml
         mode: "0644"
         content: |
-          # [읽기/쓰기] postgres-rw.miso.local → CNPG Primary
+          # [읽기/쓰기] postgres-rw.{{ base_domain }} → CNPG Primary
           apiVersion: v1
           kind: Service
           metadata:
@@ -82,7 +82,7 @@
               app.kubernetes.io/managed-by: ansible
               miso.local/role: postgres-rw
             annotations:
-              miso.local/desc: "CNPG Primary alias - postgres-rw.miso.local"
+              miso.local/desc: "CNPG Primary alias - postgres-rw.{{ base_domain }}"
               miso.local/target: "{{ cnpg_rw_fqdn }}"
           spec:
             type: ExternalName
@@ -93,7 +93,7 @@
                 targetPort: 5432
                 protocol: TCP
           ---
-          # [읽기 전용] postgres-ro.miso.local → CNPG Replica
+          # [읽기 전용] postgres-ro.{{ base_domain }} → CNPG Replica
           apiVersion: v1
           kind: Service
           metadata:
@@ -103,7 +103,7 @@
               app.kubernetes.io/managed-by: ansible
               miso.local/role: postgres-ro
             annotations:
-              miso.local/desc: "CNPG Replica alias - postgres-ro.miso.local"
+              miso.local/desc: "CNPG Replica alias - postgres-ro.{{ base_domain }}"
               miso.local/target: "{{ cnpg_ro_fqdn }}"
           spec:
             type: ExternalName
@@ -128,7 +128,7 @@
     # -----------------------------------------------------------------
     # STEP 3. DNS 해석 검증 (busybox 임시 Pod)
     #   - postgres-rw/ro.miso.local → CNPG 서비스 CNAME 반환 확인
-    #   - s3.miso.local 도 함께 확인 (MinIO 공존 검증)
+    #   - s3.{{ base_domain }} 도 함께 확인 (MinIO 공존 검증)
     # -----------------------------------------------------------------
     - name: "3. DNS 해석 검증 (busybox 임시 Pod)"
       ansible.builtin.shell: |
@@ -138,12 +138,12 @@
           --rm \
           --timeout=60s \
           -- sh -c "
-            echo '--- postgres-rw.miso.local ---' &&
-            nslookup postgres-rw.miso.local &&
-            echo '--- postgres-ro.miso.local ---' &&
-            nslookup postgres-ro.miso.local &&
-            echo '--- s3.miso.local (MinIO 공존 확인) ---' &&
-            nslookup s3.miso.local || true
+            echo '--- postgres-rw.{{ base_domain }} ---' &&
+            nslookup postgres-rw.{{ base_domain }} &&
+            echo '--- postgres-ro.{{ base_domain }} ---' &&
+            nslookup postgres-ro.{{ base_domain }} &&
+            echo '--- s3.{{ base_domain }} (MinIO 공존 확인) ---' &&
+            nslookup s3.{{ base_domain }} || true
           " 2>/dev/null || true
       register: dns_verify
       changed_when: false
@@ -196,14 +196,14 @@
           - "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
           - ""
           - " [읽기/쓰기 - Primary]"
-          - "  Host : postgres-rw.miso.local"
+          - "  Host : postgres-rw.{{ base_domain }}"
           - "  Port : 5432"
-          - "  DSN  : postgresql://miso_admin:<pw>@postgres-rw.miso.local:5432/miso"
+          - "  DSN  : postgresql://miso_admin:<pw>@postgres-rw.{{ base_domain }}:5432/miso"
           - ""
           - " [읽기 전용 - Replica]"
-          - "  Host : postgres-ro.miso.local"
+          - "  Host : postgres-ro.{{ base_domain }}"
           - "  Port : 5432"
-          - "  DSN  : postgresql://miso_admin:<pw>@postgres-ro.miso.local:5432/miso"
+          - "  DSN  : postgresql://miso_admin:<pw>@postgres-ro.{{ base_domain }}:5432/miso"
           - ""
           - " ※ 클러스터 내부 Pod 에서만 유효합니다."
           - " ※ CNPG Failover 시 연결 문자열 변경 없이 자동 반영됩니다."

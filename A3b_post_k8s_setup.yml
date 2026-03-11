@@ -30,8 +30,8 @@
       ansible.builtin.shell: |
         kubectl create secret docker-registry harbor-registry-secret \
           --docker-server={{ harbor_domain }} \
-          --docker-username=admin \
-          --docker-password={{ harbor_admin_password }} \
+          --docker-username={{ harbor_robot_user }} \
+          --docker-password={{ harbor_robot_pass }} \
           -n default
       when: secret_check.stdout | int == 0
 

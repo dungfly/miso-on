@@ -430,8 +430,8 @@
 
     - name: "5-a. Harbor Docker 로그인"
       ansible.builtin.shell: |
-        echo "{{ harbor_admin_password }}" | docker login {{ harbor_domain }} \
-          -u admin --password-stdin
+        echo '{{ harbor_robot_pass }}' | docker login {{ harbor_domain }} \
+          -u '{{ harbor_robot_user }}' --password-stdin
       changed_when: false
       no_log: true
 

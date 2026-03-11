@@ -151,9 +151,16 @@ sudo chmod 755 "${HARBOR_DATA_DIR}/redis" "${HARBOR_DATA_DIR}/registry"
 INSTALLER_TGZ="${SCRIPT_DIR}/harbor-offline-installer-${HARBOR_VERSION}.tgz"
 INSTALLER_DEST="${HOME}/harbor-offline-installer-${HARBOR_VERSION}.tgz"
 
+# installer tgz 준비
 if [ -f "${INSTALLER_TGZ}" ]; then
-  echo "  로컬 installer 사용"
-  [ "${INSTALLER_TGZ}" != "${INSTALLER_DEST}" ] && cp "${INSTALLER_TGZ}" "${INSTALLER_DEST}" || true
+  echo "  로컬 installer 사용: ${INSTALLER_TGZ}"
+  SRC_REAL=$(realpath "${INSTALLER_TGZ}")
+  DST_REAL=$(realpath "${INSTALLER_DEST}" 2>/dev/null || echo "NONE")
+  if [ "${SRC_REAL}" != "${DST_REAL}" ]; then
+    cp "${INSTALLER_TGZ}" "${INSTALLER_DEST}"
+  fi
+elif [ -f "${INSTALLER_DEST}" ]; then
+  echo "  로컬 installer 사용: ${INSTALLER_DEST}"
 else
   echo "  installer 다운로드 중..."
   curl -fL \
@@ -161,10 +168,22 @@ else
     -o "${INSTALLER_DEST}"
 fi
 
+if [ ! -f "${INSTALLER_DEST}" ]; then
+  echo "  ✗ installer tgz 없음: ${INSTALLER_DEST}"
+  exit 1
+fi
+
 # 압축 해제
 if [ ! -f "${HARBOR_INSTALL_DIR}/harbor.yml.tmpl" ]; then
+  echo "  압축 해제 중..."
   sudo tar -xzf "${INSTALLER_DEST}" -C "${HARBOR_INSTALL_DIR}" \
     --strip-components=1
+  echo "  ✓ 압축 해제 완료"
+fi
+
+if [ ! -f "${HARBOR_INSTALL_DIR}/harbor.yml.tmpl" ]; then
+  echo "  ✗ 압축 해제 실패: harbor.yml.tmpl 없음"
+  exit 1
 fi
 
 # harbor.yml 생성
@@ -181,16 +200,16 @@ if [ ! -f "${HARBOR_INSTALL_DIR}/harbor.yml" ]; then
     "${HARBOR_INSTALL_DIR}/harbor.yml"
   sudo sed -i "s|data_volume:.*|data_volume: ${HARBOR_DATA_DIR}|" \
     "${HARBOR_INSTALL_DIR}/harbor.yml"
+  echo "  ✓ harbor.yml 생성 완료"
 fi
 
 # Harbor 설치 실행
 if [ ! -f "${HARBOR_INSTALL_DIR}/docker-compose.yml" ]; then
-  # nginx가 80포트를 점유하면 Harbor nginx 컨테이너 기동 실패 → 먼저 중지
   echo "  nginx 중지 (80/443 포트 확보)..."
   sudo systemctl stop nginx 2>/dev/null || true
-  cd "${HARBOR_INSTALL_DIR}"
-  sudo ./install.sh --with-trivy
-  cd -
+  echo "  install.sh 실행 중..."
+  sudo bash "${HARBOR_INSTALL_DIR}/install.sh" --with-trivy
+  echo "  ✓ Harbor install.sh 완료"
 fi
 
 # =================================================================
@@ -199,14 +218,22 @@ fi
 echo ""
 echo ">>> [4] Harbor 기동 대기 (최대 5분)"
 
+HARBOR_READY=false
 for i in $(seq 1 60); do
-  if curl -sk "https://${HARBOR_IP}/api/v2.0/health" | grep -q "healthy"; then
+  HEALTH=$(curl -sk "https://${HARBOR_IP}/api/v2.0/health" 2>/dev/null || true)
+  if echo "${HEALTH}" | grep -q '"status": *"healthy"'; then
     echo "  ✓ Harbor 정상 기동 (${i}번째 시도)"
+    HARBOR_READY=true
     break
   fi
   echo "  대기 중... (${i}/60)"
   sleep 5
 done
+
+if [ "${HARBOR_READY}" = "false" ]; then
+  echo "  ✗ Harbor 기동 타임아웃 - 상태 확인 필요"
+  exit 1
+fi
 
 # =================================================================
 # STEP 5. miso 프로젝트 생성

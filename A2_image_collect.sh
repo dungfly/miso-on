@@ -66,6 +66,14 @@ echo ">>> [1] 컨테이너 이미지 수집"
 
 # K8s 버전 (A2 상단 vars와 맞출 것)
 K8S_VERSION="v1.30.14"
+# deb 패키지 버전 고정 (K8s 이미지 버전과 반드시 동기화)
+# 버전 확인: apt-cache policy kubelet / containerd.io / docker-ce
+# ★ 버전 고정값 - A1 실행 후 아래 명령으로 실제 버전 확인 후 수정 ★
+#   apt-cache policy kubelet
+#   apt-cache policy containerd.io docker-ce
+K8S_DEB_VERSION="1.30.14-1.1"                         # kubelet / kubeadm / kubectl
+CONTAINERD_DEB_VERSION="2.2.1-1~ubuntu.22.04~jammy"   # containerd.io
+DOCKER_CE_DEB_VERSION="5:29.3.0-1~ubuntu.22.04~jammy" # docker-ce / docker-ce-cli
 
 declare -A IMAGES=(
   # ── K8s 시스템 이미지 ──────────────────────────────
@@ -226,10 +234,15 @@ download_pkgs "common" \
   ca-certificates gnupg openssl ansible nginx apt-utils
 
 download_pkgs "k8s" \
-  containerd kubelet kubeadm kubectl
+  "kubelet=${K8S_DEB_VERSION}" \
+  "kubeadm=${K8S_DEB_VERSION}" \
+  "kubectl=${K8S_DEB_VERSION}"
 
 download_pkgs "docker" \
-  docker-ce docker-ce-cli containerd.io docker-compose-plugin
+  "docker-ce=${DOCKER_CE_DEB_VERSION}" \
+  "docker-ce-cli=${DOCKER_CE_DEB_VERSION}" \
+  "containerd.io=${CONTAINERD_DEB_VERSION}" \
+  docker-compose-plugin
 
 download_pkgs "haproxy" \
   haproxy

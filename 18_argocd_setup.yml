@@ -26,7 +26,6 @@
 
     harbor_hostname: "{{ harbor_domain }}"
     harbor_project: "miso"
-    harbor_admin_user: "admin"
 
     argocd_manifest: "http://{{ hostvars[groups['harbor'][0]]['ansible_host'] }}:8080/manifests/argocd-install.yaml"
     image_updater_manifest: "http://{{ hostvars[groups['harbor'][0]]['ansible_host'] }}:8080/manifests/argocd-image-updater.yaml"
@@ -184,8 +183,8 @@
       ansible.builtin.shell: |
         kubectl create secret docker-registry harbor-registry-secret \
           --docker-server={{ harbor_hostname }} \
-          --docker-username={{ harbor_admin_user }} \
-          --docker-password={{ harbor_admin_password }} \
+          --docker-username={{ harbor_robot_user }} \
+          --docker-password={{ harbor_robot_pass }} \
           -n {{ argocd_namespace }} \
           --dry-run=client -o yaml | kubectl apply -f -
       changed_when: true

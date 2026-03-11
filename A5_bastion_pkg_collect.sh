@@ -28,6 +28,7 @@ MONITOR_DEBS_DIR="/data/debs/monitor"
 PIP_DIR="/data/debs/pip"
 GALAXY_DIR="/data/galaxy"
 K8S_VERSION="1.30"
+KUBECTL_DEB_VERSION="1.30.14-1.1"  # kubectl deb 버전 (A2 K8S_DEB_VERSION과 동기화)
 
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 echo " A5: Bastion / Monitor 전용 패키지 수집"
@@ -177,13 +178,33 @@ BASTION_ROOT_PKGS=(
   apt-utils
 )
 
-echo "  의존성 포함 전체 패키지 목록 계산 중..."
-mapfile -t BASTION_ALL_PKGS < <(resolve_pkg_closure "${BASTION_ROOT_PKGS[@]}")
+# apt-rdepends용 패키지명만 (버전 제외), download시에는 버전 고정
+BASTION_DOWNLOAD_PKGS=(
+  ansible
+  python3-pip
+  jq
+  net-tools
+  "kubectl=${KUBECTL_DEB_VERSION}"
+  apt-utils
+)
 
-if [ "${#BASTION_ALL_PKGS[@]}" -eq 0 ]; then
+echo "  의존성 포함 전체 패키지 목록 계산 중..."
+# apt-rdepends는 패키지명만 받음 (버전 지정 불가)
+mapfile -t BASTION_DEP_PKGS < <(resolve_pkg_closure "${BASTION_ROOT_PKGS[@]}")
+
+if [ "${#BASTION_DEP_PKGS[@]}" -eq 0 ]; then
   echo "  ✗ Bastion 패키지 목록 계산 실패"
   exit 1
 fi
+
+# 버전 고정 패키지로 덮어쓰기 (kubectl 등)
+# BASTION_DEP_PKGS에서 버전 고정 대상 패키지명 제거 후 BASTION_DOWNLOAD_PKGS 병합
+BASTION_VERSIONED_NAMES=(kubectl)
+mapfile -t BASTION_FILTERED_PKGS < <(
+  printf '%s\n' "${BASTION_DEP_PKGS[@]}" \
+    | grep -vxF "$(printf '%s\n' "${BASTION_VERSIONED_NAMES[@]}")"
+)
+BASTION_ALL_PKGS=("${BASTION_FILTERED_PKGS[@]}" "${BASTION_DOWNLOAD_PKGS[@]}")
 
 echo "  총 ${#BASTION_ALL_PKGS[@]}개 패키지 후보"
 reset_repo_dir "${BASTION_DEBS_DIR}"
