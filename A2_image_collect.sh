@@ -123,6 +123,9 @@ declare -A IMAGES=(
   ["cert-manager-cainjector"]="quay.io/jetstack/cert-manager-cainjector:v1.14.4"
   # ── Gitea ────────────────────────────────────────────
   ["gitea"]="gitea/gitea:1.25.4"
+  ["postgres-exporter"]="quay.io/prometheuscommunity/postgres-exporter:v0.15.0"
+  ["redis-exporter"]="oliver006/redis_exporter:v1.58.0"
+  ["opensearch-exporter"]="quay.io/prometheuscommunity/elasticsearch-exporter:v1.7.0"
 )
 
 # 초기 로그인 확인
