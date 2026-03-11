@@ -42,43 +42,12 @@
         state: present
         update_cache: yes
 
-    - name: "5. Containerd 설정 파일 생성 (2.x 호환)"
-      ansible.builtin.copy:
-        dest: /tmp/fix_containerd.py
-        mode: "0755"
-        content: |
-          import re
-          with open("/etc/containerd/config.toml", "r") as f:
-              c = f.read()
-          c = c.replace("SystemdCgroup = false", "SystemdCgroup = true")
-          c = re.sub(r"disabled_plugins\s*=\s*\[[^\]]*\"cri\"[^\]]*\]", "disabled_plugins = []", c)
-          c = re.sub(r'sandbox_image\s*=\s*"[^"]*"', 'sandbox_image = "{{ harbor_domain }}/{{ harbor_project }}/pause:3.9"', c)
-          c = re.sub(r"sandbox\s*=\s*'[^']*'", "sandbox = '{{ harbor_domain }}/{{ harbor_project }}/pause:3.9'", c)
-          c = re.sub(r"^[ \t]*config_path[ \t]*=[^\n]*\n", "", c, flags=re.MULTILINE)
-          if "io.containerd.cri.v1.images" in c:
-              c = re.sub(
-                  r"(\[plugins\.'io\.containerd\.cri\.v1\.images'\.registry\])",
-                  r"\1\n        config_path = '/etc/containerd/certs.d'",
-                  c
-              )
-          else:
-              c = re.sub(
-                  r'(\[plugins\."io\.containerd\.grpc\.v1\.cri"\.registry\])',
-                  r'\1\n        config_path = "/etc/containerd/certs.d"',
-                  c
-              )
-          with open("/etc/containerd/config.toml", "w") as f:
-              f.write(c)
-          print("config.toml updated")
-
-    - name: "5-b. Containerd config.toml 생성 및 최적화 실행"
-      ansible.builtin.shell: |
-        set -e
-        mkdir -p /etc/containerd
-        [ -f /etc/containerd/config.toml ] || containerd config default > /etc/containerd/config.toml
-        python3 /tmp/fix_containerd.py
-      changed_when: true
-
+    - name: "5. Containerd config.toml 배포 (template)"
+      ansible.builtin.template:
+        src: containerd_config.toml.j2
+        dest: /etc/containerd/config.toml
+        mode: "0644"
+      become: yes
     - name: 7. Containerd 즉시 재시작 및 활성화
       ansible.builtin.systemd:
         name: containerd
@@ -143,6 +112,8 @@
       delegate_to: master1
       run_once: true
       become: yes
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
       command: kubeadm token create --print-join-command
       register: worker_join_cmd
 

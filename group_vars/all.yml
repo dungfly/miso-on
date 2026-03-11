@@ -12,6 +12,7 @@
 base_domain: "miso.local"
 
 harbor_domain:        "harbor.{{ base_domain }}"
+gitea_domain:         "gitea.{{ base_domain }}"      
 argocd_domain:        "argocd.{{ base_domain }}"
 monitor_domain:       "monitor.{{ base_domain }}"
 prometheus_domain:    "prometheus.{{ base_domain }}"

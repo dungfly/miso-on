@@ -52,15 +52,15 @@
         port: "9001"
         enabled: true
       - name: "tunnel-redis"
-        description: "Redis port-forward (redis-master:6379)"
-        svc: "redis-master"
+        description: "Redis port-forward (miso-redis-master:6379)"
+        svc: "miso-redis-master"
         port: "6379"
-        enabled: false   # Redis 설치 후 true로 변경
+        enabled: true
       - name: "tunnel-opensearch"
-        description: "OpenSearch port-forward (opensearch-svc:9200)"
-        svc: "opensearch-svc"
+        description: "OpenSearch port-forward (miso-opensearch:9200)"
+        svc: "miso-opensearch"
         port: "9200"
-        enabled: false   # OpenSearch 설치 후 true로 변경
+        enabled: true
 
   tasks:
     # -----------------------------------------------------------------
@@ -214,9 +214,8 @@
           - " [내 PC에서 SSH 터널]"
           - "  PostgreSQL : ssh -L 5432:localhost:5432 -i <key.pem> ubuntu@<bastion-IP> -N"
           - "  MinIO      : ssh -L 9001:localhost:9001 -i <key.pem> ubuntu@<bastion-IP> -N"
-          - ""
-          - " [향후 서비스 추가 시 (Redis, OpenSearch)]"
-          - "  tunnel_services 에서 enabled: true 로 변경 후 재실행"
-          - "  ansible-playbook -i hosts.ini 91_tunnel_setting.yml"
+          - "  Redis      : ssh -L 6379:localhost:6379 -i <key.pem> ubuntu@<bastion-IP> -N"
+          - "  OpenSearch : ssh -L 9200:localhost:9200 -i <key.pem> ubuntu@<bastion-IP> -N"
+
           - "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
       when: tunnel_action != 'stop'

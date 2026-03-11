@@ -226,6 +226,20 @@
         sed -i 's|quay.io/tigera/operator:v1.32.3|{{ harbor_domain }}/{{ harbor_project }}/tigera-operator:v1.32.3|g' \
           /tmp/tigera-operator.yaml
 
+    - name: 21-b2. kubernetes-admin cluster-admin 권한 준비 대기 (run_once)
+      delegate_to: localhost
+      run_once: true
+      become: false
+      environment:
+        KUBECONFIG: /tmp/kubeconfig-admin.conf
+      shell: |
+        kubectl auth can-i '*' '*' --all-namespaces
+      register: rbac_check
+      until: rbac_check.rc == 0 and rbac_check.stdout == "yes"
+      retries: 20
+      delay: 10
+      changed_when: false
+
     - name: 21-c. tigera-operator 설치 (bastion run_once)
       delegate_to: localhost
       run_once: true

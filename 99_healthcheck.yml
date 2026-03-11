@@ -235,16 +235,91 @@
     # ------------------------------------------------------------------
     # 요약
     # ------------------------------------------------------------------
+    # ------------------------------------------------------------------
+    # [11] 접속 정보 수집 (자동 생성 패스워드 포함)
+    # ------------------------------------------------------------------
+    - name: "[11] ArgoCD 초기 admin 패스워드 수집"
+      ansible.builtin.shell: |
+        kubectl get secret argocd-initial-admin-secret -n argocd \
+          -o jsonpath='{.data.password}' 2>/dev/null | base64 -d || echo "(secret 없음 - 이미 변경됨)"
+      register: argocd_pass
+      changed_when: false
+      failed_when: false
+
+    - name: "[11] Harbor admin 패스워드 수집 (A1_harbor_install.sh)"
+      ansible.builtin.shell: |
+        grep -m1 "^HARBOR_ADMIN_PASSWORD=" {{ playbook_dir }}/A1_harbor_install.sh \
+          | sed 's/HARBOR_ADMIN_PASSWORD="${HARBOR_ADMIN_PASSWORD:-//;s/}".*$//'
+      register: harbor_admin_pass
+      changed_when: false
+      failed_when: false
+
+    - name: "[11] Harbor robot secret 수집"
+      ansible.builtin.shell: |
+        cat ~/harbor-robot-secret.txt 2>/dev/null || echo "(파일 없음)"
+      register: harbor_robot
+      changed_when: false
+      failed_when: false
+
+    - name: "[11] Gitea admin 패스워드 수집 (A6_gitea_install.sh)"
+      ansible.builtin.shell: |
+        grep -m1 "^GITEA_ADMIN_PASSWORD=" {{ playbook_dir }}/A6_gitea_install.sh \
+          | sed 's/GITEA_ADMIN_PASSWORD="${GITEA_ADMIN_PASSWORD:-//;s/}".*$//'
+      register: gitea_admin_pass
+      changed_when: false
+      failed_when: false
     - name: "헬스체크 완료 안내"
       ansible.builtin.debug:
         msg:
           - "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
           - " 헬스체크 완료 - OK / WARN 로 결과를 확인하세요"
           - "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-          - " 주요 서비스 접속 URL:"
-          - "  https://{{ harbor_domain }}      Harbor"
-          - "  https://{{ argocd_domain }}      ArgoCD"
-          - "  https://monitor.{{ base_domain }}     Grafana"
-          - "  https://dashboard.{{ base_domain }}   OpenSearch Dashboards"
-          - "  https://s3console.{{ base_domain }}   MinIO Console"
+          - ""
+          - " [접속 URL 및 계정 정보]"
+          - ""
+          - " Harbor"
+          - "   URL  : https://{{ harbor_domain }}"
+          - "   ID   : admin / {{ harbor_admin_pass.stdout }}"
+          - "   Robot: {{ harbor_robot.stdout }}"
+          - ""
+          - " Gitea"
+          - "   URL  : https://{{ gitea_domain }}"
+          - "   ID   : gitea / {{ gitea_admin_pass.stdout }}"
+          - ""
+          - " ArgoCD"
+          - "   URL  : https://{{ argocd_domain }}"
+          - "   ID   : admin / {{ argocd_pass.stdout }}"
+          - ""
+          - " Grafana"
+          - "   URL  : https://{{ monitor_domain }}"
+          - "   ID   : admin / {{ grafana_admin_password }}"
+          - ""
+          - " OpenSearch Dashboards"
+          - "   URL  : https://{{ dashboard_domain }}"
+          - "   ID   : admin / {{ opensearch_admin_password }}"
+          - ""
+          - " MinIO Console"
+          - "   URL  : https://{{ minio_console_domain }}"
+          - "   ID   : {{ minio_root_user }} / {{ minio_root_password }}"
+          - ""
+          - " PostgreSQL (CNPG)"
+          - "   RW   : {{ postgres_rw_domain }}:5432"
+          - "   RO   : {{ postgres_ro_domain }}:5432"
+          - "   DB   : {{ pg_db_name }} / owner: {{ pg_db_owner }}"
+          - ""
+          - " Redis"
+          - "   Host : {{ redis_domain }}:6379"
+          - "   Pass : {{ redis_password }}"
+          - ""
+          - " ※ 접속 PC에 CA 인증서(ca.crt) 설치 필요"
+          - "   Windows: 00_install_ca_windows.bat (관리자 권한)"
+          - "   macOS  : bash 00_install_ca_macos.sh"
+          - ""
+          - " [SSH 터널 - PostgreSQL/Redis/OpenSearch/MinIO 직접 접속]"
+          - "   ansible-playbook -i hosts.ini 91_tunnel_setting.yml"
+          - ""
+          - "   ssh -L 5432:localhost:5432 -i miso-key.pem ubuntu@<bastion-IP> -N  # PostgreSQL"
+          - "   ssh -L 6379:localhost:6379 -i miso-key.pem ubuntu@<bastion-IP> -N  # Redis"
+          - "   ssh -L 9200:localhost:9200 -i miso-key.pem ubuntu@<bastion-IP> -N  # OpenSearch"
+          - "   ssh -L 9001:localhost:9001 -i miso-key.pem ubuntu@<bastion-IP> -N  # MinIO Console"
           - "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"

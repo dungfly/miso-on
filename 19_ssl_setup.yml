@@ -416,6 +416,89 @@
       delegate_to: "{{ groups['monitoring'][0] }}"
       changed_when: true
 
+
+    # ---------------------------------------------------------------
+    # STEP 7-gitea. Gitea nginx reverse proxy + TLS 설정
+    # (Harbor VM에서 직접 처리 - Gitea와 동거)
+    # ---------------------------------------------------------------
+    - name: "7-gitea-a. nginx certs 디렉토리 생성 (Harbor VM)"
+      ansible.builtin.file:
+        path: /etc/nginx/certs
+        state: directory
+        mode: "0750"
+        owner: root
+        group: www-data
+      become: yes
+      delegate_to: "{{ groups['harbor'][0] }}"
+
+    - name: "7-gitea-b. 인증서 파일 복사 (Harbor VM)"
+      ansible.builtin.copy:
+        src: "{{ item.src }}"
+        dest: "{{ item.dest }}"
+        mode: "0640"
+        owner: root
+        group: www-data
+      become: yes
+      delegate_to: "{{ groups['harbor'][0] }}"
+      loop:
+        - { src: "{{ tls_cert }}", dest: "/etc/nginx/certs/tls.crt" }
+        - { src: "{{ tls_key }}",  dest: "/etc/nginx/certs/tls.key" }
+
+    - name: "7-gitea-c. Gitea nginx 설정 배포 (Harbor VM)"
+      ansible.builtin.copy:
+        dest: /etc/nginx/sites-available/gitea
+        mode: "0644"
+        content: |
+          # HTTPS reverse proxy → Gitea (localhost:3000)
+          # 80/443은 Harbor Docker Compose가 점유 → 8443 사용
+          server {
+              listen 8443 ssl;
+              server_name {{ gitea_domain }};
+
+              ssl_certificate     /etc/nginx/certs/tls.crt;
+              ssl_certificate_key /etc/nginx/certs/tls.key;
+              ssl_protocols       TLSv1.2 TLSv1.3;
+              ssl_ciphers         HIGH:!aNULL:!MD5;
+
+              # git HTTP 대용량 push 허용
+              client_max_body_size 0;
+
+              location / {
+                  proxy_pass         http://localhost:3000;
+                  proxy_set_header   Host $host;
+                  proxy_set_header   X-Real-IP $remote_addr;
+                  proxy_set_header   X-Forwarded-For $proxy_add_x_forwarded_for;
+                  proxy_set_header   X-Forwarded-Proto $scheme;
+                  proxy_redirect     http://localhost:3000/ https://{{ gitea_domain }}/;
+              }
+          }
+      become: yes
+      delegate_to: "{{ groups['harbor'][0] }}"
+      notify: Reload nginx (harbor)
+
+    - name: "7-gitea-d. nginx sites-enabled 심볼릭 링크 (Harbor VM)"
+      ansible.builtin.file:
+        src: /etc/nginx/sites-available/gitea
+        dest: /etc/nginx/sites-enabled/gitea
+        state: link
+      become: yes
+      delegate_to: "{{ groups['harbor'][0] }}"
+      notify: Reload nginx (harbor)
+
+    - name: "7-gitea-e. apt-mirror default site 충돌 방지 확인"
+      ansible.builtin.shell: |
+        # apt-mirror(8080)는 건드리지 않고 default(80/443)만 비활성화
+        rm -f /etc/nginx/sites-enabled/default
+      become: yes
+      delegate_to: "{{ groups['harbor'][0] }}"
+      changed_when: true
+
+    - name: "7-gitea-f. nginx 설정 검증 후 재시작 (Harbor VM)"
+      ansible.builtin.shell: nginx -t && systemctl restart nginx
+      become: yes
+      delegate_to: "{{ groups['harbor'][0] }}"
+      changed_when: true
+
     # ---------------------------------------------------------------
     # 완료 안내
     # ---------------------------------------------------------------
@@ -431,6 +514,7 @@
           - " https://{{ prometheus_domain }}     (Prometheus)"
           - " https://{{ alertmanager_domain }}   (AlertManager)"
           - " https://{{ dashboard_domain }}   (OpenSearch Dashboards)"
+          - " https://{{ gitea_domain }}       (Gitea)"
           - ""
           - " ※ 접속 PC에 CA 인증서(ca.crt) 설치 필요"
           - "   Windows: 00_install_ca_windows.bat (관리자 권한)"
@@ -445,6 +529,14 @@
         enabled: yes
       become: yes
       delegate_to: "{{ groups['monitoring'][0] }}"
+
+    - name: Reload nginx (harbor)
+      ansible.builtin.systemd:
+        name: nginx
+        state: restarted
+        enabled: yes
+      become: yes
+      delegate_to: "{{ groups['harbor'][0] }}"
 
 # ---------------------------------------------------------------
 # STEP 8. MinIO Console Ingress - wildcard Secret으로 교체

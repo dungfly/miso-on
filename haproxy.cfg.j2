@@ -73,6 +73,7 @@ frontend k8s-ingress-https
     use_backend monitor-https if { req_ssl_sni -i {{ monitor_domain }} }
     use_backend monitor-https if { req_ssl_sni -i {{ prometheus_domain }} }
     use_backend monitor-https if { req_ssl_sni -i {{ alertmanager_domain }} }
+    use_backend gitea-https   if { req_ssl_sni -i {{ gitea_domain }} }
     default_backend k8s-workers-https
 
 backend k8s-workers-https
@@ -88,4 +89,10 @@ backend k8s-workers-https
 backend monitor-https
     mode tcp
     server monitor {{ monitor_ip }}:443 check
-    
+
+# =========================================================
+# [Backend] Gitea (Harbor VM 직접 연결) HTTPS :443
+# =========================================================
+backend gitea-https
+    mode tcp
+    server gitea {{ harbor_ip }}:8443 check

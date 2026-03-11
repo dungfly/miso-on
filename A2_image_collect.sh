@@ -121,6 +121,8 @@ declare -A IMAGES=(
   ["cert-manager-controller"]="quay.io/jetstack/cert-manager-controller:v1.14.4"
   ["cert-manager-webhook"]="quay.io/jetstack/cert-manager-webhook:v1.14.4"
   ["cert-manager-cainjector"]="quay.io/jetstack/cert-manager-cainjector:v1.14.4"
+  # ── Gitea ────────────────────────────────────────────
+  ["gitea"]="gitea/gitea:1.25.4"
 )
 
 # 초기 로그인 확인
