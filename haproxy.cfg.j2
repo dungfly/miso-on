@@ -18,11 +18,11 @@ defaults
 # [Frontend] Kubernetes API (Control Plane) :6443 (TCP)
 # =========================================================
 frontend k8s-api
-    {% if bind_vip | default(false) %}
+{% if bind_vip | default(false) %}
     bind {{ vip_ip }}:6443
-    {% else %}
+{% else %}
     bind *:6443
-    {% endif %}
+{% endif %}
     mode tcp
     option tcplog
     default_backend k8s-masters
@@ -31,68 +31,92 @@ backend k8s-masters
     mode tcp
     balance roundrobin
     option tcp-check
-    {% for node in master_nodes %}
+{% for node in master_nodes %}
     server {{ node.name }} {{ node.ip }}:6443 check
-    {% endfor %}
+{% endfor %}
 
 # =========================================================
-# [Frontend] Ingress HTTP :80 -> worker NodePort 30080 (HTTP)
+# [Frontend] Ingress HTTP :80
+#   - monitor/prometheus/alertmanager/gitea 는 즉시 HTTPS로 redirect
+#   - 나머지는 K8s worker NodePort 30080 으로 전달
 # =========================================================
 frontend k8s-ingress-http
-    {% if bind_vip | default(false) %}
+{% if bind_vip | default(false) %}
     bind {{ vip_ip }}:80
-    {% else %}
+{% else %}
     bind *:80
-    {% endif %}
+{% endif %}
     mode http
+
+    # Host 헤더에서 포트가 붙어와도 매칭되도록 host_only 사용
+    http-request set-var(txn.host_only) req.hdr(host),field(1,:),lower
+
+    acl host_monitor      var(txn.host_only) -m str {{ monitor_domain | lower }}
+    acl host_prometheus   var(txn.host_only) -m str {{ prometheus_domain | lower }}
+    acl host_alertmanager var(txn.host_only) -m str {{ alertmanager_domain | lower }}
+    acl host_gitea        var(txn.host_only) -m str {{ gitea_domain | lower }}
+
+    # 별도 VM 서비스들은 HTTP로 ingress에 보내지 말고 즉시 HTTPS로 redirect
+    http-request redirect scheme https code 301 if host_monitor
+    http-request redirect scheme https code 301 if host_prometheus
+    http-request redirect scheme https code 301 if host_alertmanager
+    http-request redirect scheme https code 301 if host_gitea
+
     default_backend k8s-workers-http
 
 backend k8s-workers-http
     mode http
     balance roundrobin
-    {% for node in worker_nodes %}
+{% for node in worker_nodes %}
     server {{ node.name }} {{ node.ip }}:{{ ingress_http_nodeport }} check
-    {% endfor %}
+{% endfor %}
 
 # =========================================================
 # [Frontend] Ingress HTTPS :443 -> SNI 기반 분기
-#   - monitor/prometheus/alertmanager -> Monitor VM 직접
-#   - 나머지 -> K8s worker NodePort 30443
+#   - monitor/prometheus/alertmanager -> Monitor VM :443 직접
+#   - gitea                           -> Harbor VM  :8443 직접
+#   - 나머지                          -> K8s worker NodePort 30443
 # =========================================================
 frontend k8s-ingress-https
-    {% if bind_vip | default(false) %}
+{% if bind_vip | default(false) %}
     bind {{ vip_ip }}:443
-    {% else %}
+{% else %}
     bind *:443
-    {% endif %}
+{% endif %}
     mode tcp
     option tcplog
+
+    # ClientHello 에서 SNI 확인 후 분기
+    # WAIT_END 제거 - SNI 못 읽으면 default로 낙하
     tcp-request inspect-delay 5s
     tcp-request content accept if { req_ssl_hello_type 1 }
-    tcp-request content accept if WAIT_END
+
     use_backend monitor-https if { req_ssl_sni -i {{ monitor_domain }} }
     use_backend monitor-https if { req_ssl_sni -i {{ prometheus_domain }} }
     use_backend monitor-https if { req_ssl_sni -i {{ alertmanager_domain }} }
     use_backend gitea-https   if { req_ssl_sni -i {{ gitea_domain }} }
+
     default_backend k8s-workers-https
 
 backend k8s-workers-https
     mode tcp
     balance roundrobin
-    {% for node in worker_nodes %}
+{% for node in worker_nodes %}
     server {{ node.name }} {{ node.ip }}:{{ ingress_https_nodeport }} check
-    {% endfor %}
+{% endfor %}
 
 # =========================================================
 # [Backend] Monitor VM 직접 연결 (Grafana/Prometheus/AlertManager)
 # =========================================================
 backend monitor-https
     mode tcp
+    option tcp-check
     server monitor {{ monitor_ip }}:443 check
 
 # =========================================================
-# [Backend] Gitea (Harbor VM 직접 연결) HTTPS :443
+# [Backend] Gitea (Harbor VM 직접 연결) HTTPS :8443
 # =========================================================
 backend gitea-https
     mode tcp
+    option tcp-check
     server gitea {{ harbor_ip }}:8443 check

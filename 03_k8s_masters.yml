@@ -38,17 +38,101 @@
     # ---------------------------------------------------------------
     - name: 4. Containerd 설치
       apt:
-        name: containerd.io
+        name: containerd
         state: present
         update_cache: yes
 
-    - name: "5. Containerd config.toml 배포 (template)"
-      ansible.builtin.template:
-        src: containerd_config.toml.j2
-        dest: /etc/containerd/config.toml
-        owner: root
-        group: root
-        mode: "0644"
+    - name: 5. Containerd 기본 설정 생성
+      shell: |
+        mkdir -p /etc/containerd
+        containerd config default > /etc/containerd/config.toml
+      args:
+        creates: /etc/containerd/config.toml
+
+    - name: 6. Containerd SystemdCgroup 활성화
+      replace:
+        path: /etc/containerd/config.toml
+        regexp: 'SystemdCgroup = false'
+        replace: 'SystemdCgroup = true'
+
+    - name: "6-b. sandbox_image를 Harbor pause:3.9로 변경"
+      ansible.builtin.replace:
+        path: /etc/containerd/config.toml
+        regexp: 'sandbox_image = ".*"'
+        replace: 'sandbox_image = "{{ harbor_domain }}/{{ harbor_project }}/pause:3.9"'
+
+    - name: "Harbor /etc/hosts 등록"
+      ansible.builtin.lineinfile:
+        path: /etc/hosts
+        regexp: "harbor.{{ base_domain }}$"
+        line: "{{ harbor_ip }} harbor.{{ base_domain }}"
+        state: present
+
+    - name: "containerd certs.d 디렉토리 생성"
+      ansible.builtin.file:
+        path: "/etc/containerd/certs.d/{{ item }}"
+        state: directory
+        mode: "0755"
+      loop:
+        - "{{ harbor_domain }}"
+        - "registry.k8s.io"
+        - "docker.io"
+        - "quay.io"
+
+    - name: "Harbor mirror hosts.toml 설정 (인증 포함)"
+      ansible.builtin.copy:
+        dest: "/etc/containerd/certs.d/{{ harbor_domain }}/hosts.toml"
+        mode: "0600"
+        content: |
+          server = "https://{{ harbor_domain }}"
+          [host."https://{{ harbor_domain }}"]
+            capabilities = ["pull", "resolve"]
+            skip_verify = true
+          [host."https://{{ harbor_domain }}".header]
+            Authorization = ["Basic {{ (harbor_robot_user + ':' + harbor_robot_pass) | b64encode }}"]
+
+    - name: "registry.k8s.io → Harbor mirror 설정"
+      ansible.builtin.copy:
+        dest: /etc/containerd/certs.d/registry.k8s.io/hosts.toml
+        mode: "0600"
+        content: |
+          server = "https://registry.k8s.io"
+          [host."https://{{ harbor_domain }}"]
+            capabilities = ["pull", "resolve"]
+            skip_verify = true
+          [host."https://{{ harbor_domain }}".header]
+            Authorization = ["Basic {{ (harbor_robot_user + ':' + harbor_robot_pass) | b64encode }}"]
+
+    - name: "docker.io → Harbor mirror 설정"
+      ansible.builtin.copy:
+        dest: /etc/containerd/certs.d/docker.io/hosts.toml
+        mode: "0600"
+        content: |
+          server = "https://docker.io"
+          [host."https://{{ harbor_domain }}"]
+            capabilities = ["pull", "resolve"]
+            skip_verify = true
+          [host."https://{{ harbor_domain }}".header]
+            Authorization = ["Basic {{ (harbor_robot_user + ':' + harbor_robot_pass) | b64encode }}"]
+
+    - name: "quay.io → Harbor mirror 설정"
+      ansible.builtin.copy:
+        dest: /etc/containerd/certs.d/quay.io/hosts.toml
+        mode: "0600"
+        content: |
+          server = "https://quay.io"
+          [host."https://{{ harbor_domain }}"]
+            capabilities = ["pull", "resolve"]
+            skip_verify = true
+          [host."https://{{ harbor_domain }}".header]
+            Authorization = ["Basic {{ (harbor_robot_user + ':' + harbor_robot_pass) | b64encode }}"]
+
+    - name: "containerd config_path 설정 (hosts.toml 활성화)"
+      ansible.builtin.replace:
+        path: /etc/containerd/config.toml
+        regexp: 'config_path = ""'
+        replace: 'config_path = "/etc/containerd/certs.d"'
+      ignore_errors: yes
 
     - name: 7. Containerd 즉시 재시작 및 활성화
       ansible.builtin.systemd:
@@ -226,19 +310,25 @@
         sed -i 's|quay.io/tigera/operator:v1.32.3|{{ harbor_domain }}/{{ harbor_project }}/tigera-operator:v1.32.3|g' \
           /tmp/tigera-operator.yaml
 
-    - name: 21-b2. kubernetes-admin cluster-admin 권한 준비 대기 (run_once)
+    - name: 21-c-pre. API 서버 RBAC 안정화 대기
       delegate_to: localhost
       run_once: true
       become: false
       environment:
         KUBECONFIG: /tmp/kubeconfig-admin.conf
       shell: |
-        kubectl auth can-i '*' '*' --all-namespaces
-      register: rbac_check
-      until: rbac_check.rc == 0 and rbac_check.stdout == "yes"
-      retries: 20
-      delay: 10
-      changed_when: false
+        # master 조인 직후 RBAC 초기화 완료 대기
+        for i in $(seq 1 20); do
+          result=$(kubectl auth can-i patch customresourcedefinitions 2>/dev/null)
+          if [ "$result" = "yes" ]; then
+            echo "RBAC ready"
+            exit 0
+          fi
+          echo "Waiting for RBAC... ($i/20)"
+          sleep 5
+        done
+        echo "RBAC wait timeout - proceeding anyway"
+        exit 0
 
     - name: 21-c. tigera-operator 설치 (bastion run_once)
       delegate_to: localhost

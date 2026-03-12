@@ -208,6 +208,23 @@
       loop: "{{ groups['k8s'] | list }}"
       changed_when: true
 
+#    - name: "5-c. 외부 공인 CA 번들을 K8s 노드에 추가 (Sectigo 등)"
+#      ansible.builtin.copy:
+#        src: "{{ playbook_dir }}/ca-bundle.crt"
+#        dest: /usr/local/share/ca-certificates/external-ca-bundle.crt
+#        mode: "0644"
+#      become: yes
+#      delegate_to: "{{ item }}"
+#      loop: "{{ groups['k8s'] | list }}"
+
+#    - name: "5-d. 시스템 CA 신뢰 저장소 업데이트"
+#      ansible.builtin.shell: update-ca-certificates
+#      become: yes
+#      delegate_to: "{{ item }}"
+#      loop: "{{ groups['k8s'] | list }}"
+#      changed_when: true
+
+
     # ---------------------------------------------------------------
     # STEP 6. Harbor 인증서 교체
     # (Harbor VM에서 직접 처리)
@@ -328,6 +345,9 @@
                   proxy_set_header   X-Real-IP $remote_addr;
                   proxy_set_header   X-Forwarded-For $proxy_add_x_forwarded_for;
                   proxy_set_header   X-Forwarded-Proto $scheme;
+                  proxy_set_header   Upgrade $http_upgrade;
+                  proxy_set_header   Connection "upgrade";
+                  proxy_http_version 1.1;
                   proxy_redirect     http://localhost:3000/ https://{{ monitor_domain }}/;
               }
           }
@@ -498,6 +518,20 @@
       become: yes
       delegate_to: "{{ groups['harbor'][0] }}"
       changed_when: true
+
+    # ---------------------------------------------------------------
+    # Grafana 기동 완료 대기 (nginx restart 후 Grafana ready 확인)
+    # ---------------------------------------------------------------
+    - name: "Grafana health check 대기 (최대 2분)"
+      ansible.builtin.uri:
+        url: "http://{{ hostvars[groups['monitoring'][0]]['ansible_host'] }}:3000/api/health"
+        status_code: 200
+      register: grafana_health
+      until: grafana_health.status == 200
+      retries: 24
+      delay: 5
+      delegate_to: localhost
+      become: false
 
     # ---------------------------------------------------------------
     # 완료 안내

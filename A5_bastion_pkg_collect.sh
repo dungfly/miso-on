@@ -6,12 +6,16 @@
 #             A1, A2 완료 후 실행
 #
 # [결과물]
+#   /data/debs/common/   -> Harbor 복원용 공통 deb repo
+#   /data/debs/docker/   -> Harbor 복원용 Docker CE deb repo
 #   /data/debs/bastion/  -> Bastion용 deb repo
 #   /data/debs/monitor/  -> Monitor VM용 deb repo
 #   /data/debs/pip/      -> pip wheel
 #   /data/galaxy/        -> Ansible Galaxy collections
 #
 # [서빙 주소]
+#   http://<harbor_ip>:8080/debs/common/
+#   http://<harbor_ip>:8080/debs/docker/
 #   http://<harbor_ip>:8080/debs/bastion/
 #   http://<harbor_ip>:8080/debs/monitor/
 #   http://<harbor_ip>:8080/debs/pip/
@@ -23,6 +27,8 @@
 set -uo pipefail
 export DEBIAN_FRONTEND=noninteractive
 
+COMMON_DEBS_DIR="/data/debs/common"
+DOCKER_DEBS_DIR="/data/debs/docker"
 BASTION_DEBS_DIR="/data/debs/bastion"
 MONITOR_DEBS_DIR="/data/debs/monitor"
 PIP_DIR="/data/debs/pip"
@@ -31,7 +37,7 @@ K8S_VERSION="1.30"
 KUBECTL_DEB_VERSION="1.30.14-1.1"  # kubectl deb 버전 (A2 K8S_DEB_VERSION과 동기화)
 
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-echo " A5: Bastion / Monitor 전용 패키지 수집"
+echo " A5: Bastion / Monitor / Harbor Restore 전용 패키지 수집"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
 # =================================================================
@@ -57,7 +63,7 @@ reset_repo_dir() {
 ensure_apt_tools() {
   log "apt 도구 설치 확인"
   sudo apt-get update -qq
-  sudo apt-get install -y -qq apt-rdepends apt-utils ca-certificates gnupg curl >/dev/null
+  sudo apt-get install -y -qq apt-rdepends apt-utils dpkg-dev ca-certificates gnupg curl >/dev/null
 }
 
 ensure_k8s_repo() {
@@ -76,6 +82,24 @@ ensure_k8s_repo() {
     echo "  ✓ K8s 저장소 등록 완료"
   else
     echo "  ✓ K8s 저장소 이미 등록됨 (skip)"
+  fi
+
+  sudo apt-get update -qq
+}
+
+ensure_docker_repo() {
+  echo ""
+  echo ">>> [1-b] Docker 저장소 등록"
+  sudo mkdir -p /etc/apt/keyrings
+
+  if [ ! -f /etc/apt/keyrings/docker.gpg ] || [ ! -f /etc/apt/sources.list.d/docker.list ]; then
+    curl -fsSL https://download.docker.com/linux/ubuntu/gpg \
+      | sudo gpg --dearmor --yes -o /etc/apt/keyrings/docker.gpg
+    echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu jammy stable" \
+      | sudo tee /etc/apt/sources.list.d/docker.list >/dev/null
+    echo "  ✓ Docker repo 등록 완료"
+  else
+    echo "  ✓ Docker repo 이미 등록됨 (skip)"
   fi
 
   sudo apt-get update -qq
@@ -155,6 +179,8 @@ serve_check() {
 # =================================================================
 # 초기 디렉토리 준비
 # =================================================================
+ensure_dir "${COMMON_DEBS_DIR}"
+ensure_dir "${DOCKER_DEBS_DIR}"
 ensure_dir "${BASTION_DEBS_DIR}"
 ensure_dir "${MONITOR_DEBS_DIR}"
 ensure_dir "${PIP_DIR}"
@@ -162,12 +188,55 @@ ensure_dir "${GALAXY_DIR}"
 
 ensure_apt_tools
 ensure_k8s_repo
+ensure_docker_repo
 
 # =================================================================
-# STEP 2. Bastion 전용 deb 수집
+# STEP 2. Harbor 복원용 common deb 수집
 # =================================================================
 echo ""
-echo ">>> [2] Bastion 전용 deb 수집"
+echo ">>> [2] Harbor 복원용 common deb 수집"
+
+COMMON_ROOT_PKGS=(
+  ca-certificates
+  curl
+  gnupg
+  openssl
+  nginx
+  apt-utils
+  rsync
+)
+
+echo "  의존성 포함 전체 패키지 목록 계산 중..."
+mapfile -t COMMON_ALL_PKGS < <(resolve_pkg_closure "${COMMON_ROOT_PKGS[@]}")
+
+if [ "${#COMMON_ALL_PKGS[@]}" -eq 0 ]; then
+  echo "  ✗ common 패키지 목록 계산 실패"
+  exit 1
+fi
+
+echo "  총 ${#COMMON_ALL_PKGS[@]}개 패키지 후보"
+reset_repo_dir "${COMMON_DEBS_DIR}"
+
+echo "  apt-get download로 수집 중..."
+if ! download_pkg_set "${COMMON_DEBS_DIR}" "${COMMON_ALL_PKGS[@]}"; then
+  echo "  ! 일부 패키지 다운로드 실패가 있었음 (필수 패키지 검증 진행)"
+fi
+
+build_packages_index "${COMMON_DEBS_DIR}"
+
+COMMON_DEB_COUNT=$(find "${COMMON_DEBS_DIR}" -maxdepth 1 -name "*.deb" | wc -l)
+echo "  ✓ ${COMMON_DEB_COUNT}개 common deb 수집 완료"
+
+if ! verify_repo_has_packages "${COMMON_DEBS_DIR}" ca-certificates curl gnupg openssl nginx apt-utils rsync; then
+  echo "  ✗ common repo 필수 패키지 누락"
+  exit 1
+fi
+
+# =================================================================
+# STEP 3. Bastion 전용 deb 수집
+# =================================================================
+echo ""
+echo ">>> [3] Bastion 전용 deb 수집"
 
 BASTION_ROOT_PKGS=(
   ansible
@@ -189,7 +258,6 @@ BASTION_DOWNLOAD_PKGS=(
 )
 
 echo "  의존성 포함 전체 패키지 목록 계산 중..."
-# apt-rdepends는 패키지명만 받음 (버전 지정 불가)
 mapfile -t BASTION_DEP_PKGS < <(resolve_pkg_closure "${BASTION_ROOT_PKGS[@]}")
 
 if [ "${#BASTION_DEP_PKGS[@]}" -eq 0 ]; then
@@ -197,8 +265,6 @@ if [ "${#BASTION_DEP_PKGS[@]}" -eq 0 ]; then
   exit 1
 fi
 
-# 버전 고정 패키지로 덮어쓰기 (kubectl 등)
-# BASTION_DEP_PKGS에서 버전 고정 대상 패키지명 제거 후 BASTION_DOWNLOAD_PKGS 병합
 BASTION_VERSIONED_NAMES=(kubectl)
 mapfile -t BASTION_FILTERED_PKGS < <(
   printf '%s\n' "${BASTION_DEP_PKGS[@]}" \
@@ -225,10 +291,10 @@ if ! verify_repo_has_packages "${BASTION_DEBS_DIR}" ansible kubectl python3-pip;
 fi
 
 # =================================================================
-# STEP 3. pip wheel 수집
+# STEP 4. pip wheel 수집
 # =================================================================
 echo ""
-echo ">>> [3] ansible pip wheel 수집"
+echo ">>> [4] ansible pip wheel 수집"
 
 ensure_dir "${PIP_DIR}"
 
@@ -246,10 +312,10 @@ else
 fi
 
 # =================================================================
-# STEP 4. Ansible Galaxy 컬렉션 수집
+# STEP 5. Ansible Galaxy 컬렉션 수집
 # =================================================================
 echo ""
-echo ">>> [4] Ansible Galaxy 컬렉션 수집"
+echo ">>> [5] Ansible Galaxy 컬렉션 수집"
 
 if ! command -v ansible-galaxy >/dev/null 2>&1; then
   echo "  ansible-galaxy 없음 -> ansible 설치 시도"
@@ -270,10 +336,10 @@ else
 fi
 
 # =================================================================
-# STEP 4-b. Monitor VM용 nginx-core deb 수집
+# STEP 6. Monitor VM용 nginx-core deb 수집
 # =================================================================
 echo ""
-echo ">>> [4-b] Monitor VM용 nginx-core deb 수집"
+echo ">>> [6] Monitor VM용 nginx-core deb 수집"
 
 MONITOR_ROOT_PKGS=(
   nginx-core
@@ -309,10 +375,49 @@ if ! verify_repo_has_packages "${MONITOR_DEBS_DIR}" nginx-core nginx-common; the
 fi
 
 # =================================================================
-# STEP 5. nginx 서빙 확인
+# STEP 7. Harbor VM 복원용 Docker CE deb 수집
 # =================================================================
 echo ""
-echo ">>> [5] nginx 서빙 확인"
+echo ">>> [7] Harbor VM 복원용 Docker CE deb 수집"
+
+DOCKER_ROOT_PKGS=(
+  docker-ce
+  docker-ce-cli
+  containerd.io
+  docker-compose-plugin
+)
+
+echo "  의존성 포함 전체 패키지 목록 계산 중..."
+mapfile -t DOCKER_ALL_PKGS < <(resolve_pkg_closure "${DOCKER_ROOT_PKGS[@]}")
+
+if [ "${#DOCKER_ALL_PKGS[@]}" -eq 0 ]; then
+  echo "  ✗ Docker 패키지 목록 계산 실패"
+  exit 1
+fi
+
+echo "  총 ${#DOCKER_ALL_PKGS[@]}개 패키지 후보"
+reset_repo_dir "${DOCKER_DEBS_DIR}"
+
+echo "  apt-get download로 수집 중..."
+if ! download_pkg_set "${DOCKER_DEBS_DIR}" "${DOCKER_ALL_PKGS[@]}"; then
+  echo "  ! 일부 패키지 다운로드 실패가 있었음 (필수 패키지 검증 진행)"
+fi
+
+build_packages_index "${DOCKER_DEBS_DIR}"
+
+DOCKER_DEB_COUNT=$(find "${DOCKER_DEBS_DIR}" -maxdepth 1 -name "*.deb" | wc -l)
+echo "  ✓ ${DOCKER_DEB_COUNT}개 docker deb 수집 완료"
+
+if ! verify_repo_has_packages "${DOCKER_DEBS_DIR}" docker-ce docker-ce-cli containerd.io docker-compose-plugin; then
+  echo "  ✗ Docker repo 필수 패키지 누락"
+  exit 1
+fi
+
+# =================================================================
+# STEP 8. nginx 서빙 확인
+# =================================================================
+echo ""
+echo ">>> [8] nginx 서빙 확인"
 if ! sudo nginx -t; then
   echo "  ✗ nginx 설정 검증 실패"
   exit 1
@@ -326,6 +431,8 @@ fi
 HARBOR_IP=$(hostname -I | awk '{print $1}')
 
 if ! serve_check "${HARBOR_IP}" \
+  "debs/common/Packages" \
+  "debs/docker/Packages" \
   "debs/bastion/Packages" \
   "debs/monitor/Packages" \
   "debs/pip/" \
@@ -341,11 +448,14 @@ echo ""
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 echo " A5 완료"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo " deb common  : http://${HARBOR_IP}:8080/debs/common/"
+echo " deb docker  : http://${HARBOR_IP}:8080/debs/docker/"
 echo " deb bastion : http://${HARBOR_IP}:8080/debs/bastion/"
 echo " deb monitor : http://${HARBOR_IP}:8080/debs/monitor/"
 echo " pip         : http://${HARBOR_IP}:8080/debs/pip/"
 echo " galaxy      : http://${HARBOR_IP}:8080/galaxy/"
 echo ""
 echo " 다음 단계:"
-echo "   Bastion에서 bash 01_prep_bastion.sh"
+echo "   bash A6_gitea_install.sh"
+echo "   bash A0_harbor_snapshot.sh"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
