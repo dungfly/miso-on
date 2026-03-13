@@ -86,25 +86,11 @@
         state: directory
         mode: "0755"
 
-    - name: 11. Containerd 기본 설정 생성 및 pause direct path 강제
-      ansible.builtin.shell: |
-        set -e
-        mkdir -p /etc/containerd
-        containerd config default > /etc/containerd/config.toml
-
-        sed -i "s|config_path = ''|config_path = '/etc/containerd/certs.d'|g" /etc/containerd/config.toml
-        sed -i 's|config_path = ""|config_path = "/etc/containerd/certs.d"|g' /etc/containerd/config.toml
-        sed -i 's/SystemdCgroup = false/SystemdCgroup = true/g' /etc/containerd/config.toml
-
-        sed -i -E 's#(^[[:space:]]*sandbox_image = ).*#\1"{{ harbor_domain }}/{{ harbor_project }}/pause:{{ pause_version }}"#' /etc/containerd/config.toml || true
-        sed -i -E 's#(^[[:space:]]*sandbox = ).*#\1"{{ harbor_domain }}/{{ harbor_project }}/pause:{{ pause_version }}"#' /etc/containerd/config.toml || true
-
-        echo "=== containerd config excerpt ==="
-        grep -nE "config_path|SystemdCgroup|sandbox_image|sandbox = " /etc/containerd/config.toml || true
-      args:
-        executable: /bin/bash
-      register: containerd_config_build
-      changed_when: true
+    - name: 11. Containerd config.toml 배포 (template)
+      ansible.builtin.template:
+        src: containerd_config.toml.j2
+        dest: /etc/containerd/config.toml
+        mode: "0644"
 
     - name: 12. Harbor /etc/hosts 등록
       ansible.builtin.lineinfile:
@@ -112,33 +98,6 @@
         regexp: "harbor.{{ base_domain }}$"
         line: "{{ harbor_ip }} harbor.{{ base_domain }}"
         state: present
-
-    - name: 13. containerd certs.d 디렉토리 생성
-      ansible.builtin.file:
-        path: "/etc/containerd/certs.d/{{ harbor_domain }}"
-        state: directory
-        mode: "0755"
-
-    - name: 14. Harbor direct hosts.toml 설정 (인증 포함)
-      ansible.builtin.copy:
-        dest: "/etc/containerd/certs.d/{{ harbor_domain }}/hosts.toml"
-        mode: "0600"
-        content: |
-          server = "https://{{ harbor_domain }}"
-          [host."https://{{ harbor_domain }}"]
-            capabilities = ["pull", "resolve"]
-            skip_verify = true
-          [host."https://{{ harbor_domain }}".header]
-            Authorization = ["Basic {{ (harbor_robot_user + ':' + harbor_robot_pass) | b64encode }}"]
-
-    - name: 15. containerd config_path 검증
-      ansible.builtin.shell: |
-        set -e
-        grep -n "config_path = '/etc/containerd/certs.d'" /etc/containerd/config.toml
-        grep -n "{{ harbor_domain }}/{{ harbor_project }}/pause:{{ pause_version }}" /etc/containerd/config.toml
-      args:
-        executable: /bin/bash
-      changed_when: false
 
     - name: 16. Containerd 재시작 및 활성화
       ansible.builtin.systemd:
@@ -153,10 +112,10 @@
         state: present
         timeout: 30
 
-    - name: 18. Containerd CRI 응답 확인
+    - name: 18. Containerd CRI 응답 확인 (ctr 사용)
       ansible.builtin.shell: |
         set -e
-        crictl --runtime-endpoint unix:///run/containerd/containerd.sock info >/dev/null
+        ctr version >/dev/null
       args:
         executable: /bin/bash
       register: cri_check
@@ -168,7 +127,7 @@
     - name: 19. Harbor pause 이미지 pull 테스트
       ansible.builtin.shell: |
         set -e
-        crictl --runtime-endpoint unix:///run/containerd/containerd.sock pull {{ harbor_domain }}/{{ harbor_project }}/pause:{{ pause_version }}
+        ctr image pull --user '{{ harbor_robot_user }}:{{ harbor_robot_pass }}' {{ harbor_domain }}/{{ harbor_project }}/pause:{{ pause_version }}
       args:
         executable: /bin/bash
       register: pull_pause_test
@@ -180,7 +139,7 @@
     - name: 20. Harbor kube-apiserver 이미지 pull 테스트
       ansible.builtin.shell: |
         set -e
-        crictl --runtime-endpoint unix:///run/containerd/containerd.sock pull {{ harbor_domain }}/{{ harbor_project }}/kube-apiserver:{{ k8s_version_full }}
+        ctr image pull --user '{{ harbor_robot_user }}:{{ harbor_robot_pass }}' {{ harbor_domain }}/{{ harbor_project }}/kube-apiserver:{{ k8s_version_full }}
       args:
         executable: /bin/bash
       register: pull_apiserver_test
@@ -271,7 +230,7 @@
 
         - name: 24-r3. crictl ps 수집
           ansible.builtin.shell: |
-            crictl --runtime-endpoint unix:///run/containerd/containerd.sock ps -a || true
+            ctr containers list || true
           args:
             executable: /bin/bash
           register: crictl_ps
@@ -279,7 +238,7 @@
 
         - name: 24-r4. 모든 파드 목록 수집
           ansible.builtin.shell: |
-            crictl --runtime-endpoint unix:///run/containerd/containerd.sock pods || true
+            ctr tasks list || true
           args:
             executable: /bin/bash
           register: crictl_pods
@@ -435,6 +394,44 @@
         exit 0
       args:
         executable: /bin/bash
+      when:
+        - hostvars['master1'].adminconf_fetch is defined
+        - hostvars['master1'].adminconf_fetch is not failed
+
+    - name: 36-b. API 서버 openapi 엔드포인트 준비 대기
+      delegate_to: localhost
+      run_once: true
+      become: false
+      environment:
+        KUBECONFIG: /tmp/kubeconfig-admin.conf
+      ansible.builtin.shell: |
+        for i in $(seq 1 30); do
+          if kubectl api-resources >/dev/null 2>&1; then
+            echo "API server openapi ready"
+            exit 0
+          fi
+          echo "Waiting for API server openapi... ($i/30)"
+          sleep 5
+        done
+        echo "Timeout waiting for openapi"
+        exit 1
+      args:
+        executable: /bin/bash
+      when:
+        - hostvars['master1'].adminconf_fetch is defined
+        - hostvars['master1'].adminconf_fetch is not failed
+
+    - name: 37-pre. tigera-operator namespace 사전 생성
+      delegate_to: localhost
+      run_once: true
+      become: false
+      environment:
+        KUBECONFIG: /tmp/kubeconfig-admin.conf
+      ansible.builtin.shell: |
+        kubectl get namespace tigera-operator >/dev/null 2>&1 || kubectl create namespace tigera-operator
+      args:
+        executable: /bin/bash
+      changed_when: false
       when:
         - hostvars['master1'].adminconf_fetch is defined
         - hostvars['master1'].adminconf_fetch is not failed

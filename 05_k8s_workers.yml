@@ -6,83 +6,145 @@
     harbor_ip: "{{ hostvars[groups['harbor'][0]]['ansible_host'] }}"
     monitor_ip: "{{ hostvars[groups['monitoring'][0]]['ansible_host'] }}"
     k8s_version: "1.30"
-    # master API endpoint (HAProxy VIP)
+    k8s_version_full: "v1.30.14"
+    pause_version: "3.10.1"
     api_endpoint: "10.1.1.10"
 
   tasks:
     # ---------------------------------------------------------------
-    # STEP 1. 커널 및 네트워크 사전 준비
+    # STEP 1. 커널 / 네트워크 / swap 사전 준비
     # ---------------------------------------------------------------
     - name: 1. 커널 모듈 로드 (overlay, br_netfilter)
       ansible.builtin.command: modprobe {{ item }}
       loop:
         - overlay
         - br_netfilter
+      changed_when: false
 
     - name: 2. 커널 모듈 부팅 시 자동 로드 설정
-      copy:
+      ansible.builtin.copy:
         dest: /etc/modules-load.d/k8s.conf
+        mode: "0644"
         content: |
           overlay
           br_netfilter
 
-    - name: 3. sysctl 네트워크 설정 (Persistence 포함)
-      ansible.builtin.command: sysctl -w {{ item.name }}={{ item.value }}
-      loop:
-        - { name: 'net.bridge.bridge-nf-call-iptables',  value: '1' }
-        - { name: 'net.bridge.bridge-nf-call-ip6tables', value: '1' }
-        - { name: 'net.ipv4.ip_forward',                 value: '1' }
+    - name: 3. sysctl 영구 설정 파일 배포
+      ansible.builtin.copy:
+        dest: /etc/sysctl.d/99-kubernetes-cri.conf
+        mode: "0644"
+        content: |
+          net.bridge.bridge-nf-call-iptables = 1
+          net.bridge.bridge-nf-call-ip6tables = 1
+          net.ipv4.ip_forward = 1
+
+    - name: 4. sysctl 적용
+      ansible.builtin.command: sysctl --system
+      changed_when: false
+
+    - name: 5. swap 비활성화
+      ansible.builtin.command: swapoff -a
+      changed_when: false
+
+    - name: 6. /etc/fstab 에서 swap 주석 처리
+      ansible.builtin.replace:
+        path: /etc/fstab
+        regexp: '^([^#].*\sswap\s+.*)$'
+        replace: '# \1'
 
     # ---------------------------------------------------------------
-    # STEP 2. Containerd 설치 및 설정
+    # STEP 2. Containerd / Harbor 설정
     # ---------------------------------------------------------------
-    - name: 4. Containerd 설치
-      apt:
+    - name: 7. Docker 로컬 저장소 등록
+      ansible.builtin.copy:
+        dest: /etc/apt/sources.list.d/miso-local-docker.list
+        mode: "0644"
+        content: |
+          deb [trusted=yes] http://{{ harbor_ip }}:8080/debs/docker ./
+
+    - name: 8. K8s 로컬 저장소 확인
+      ansible.builtin.stat:
+        path: /etc/apt/sources.list.d/miso-local-k8s.list
+      register: k8s_repo_check
+
+    - name: 9. K8s 로컬 저장소 긴급 등록 (미등록 시)
+      ansible.builtin.copy:
+        dest: /etc/apt/sources.list.d/miso-local-k8s.list
+        mode: "0644"
+        content: |
+          deb [trusted=yes] http://{{ harbor_ip }}:8080/debs/k8s ./
+      when: not k8s_repo_check.stat.exists
+
+    - name: 10. 외부 저장소 비활성화
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - /etc/apt/sources.list.d/docker.list
+        - /etc/apt/sources.list.d/kubernetes.list
+
+    - name: 11. Containerd 설치
+      ansible.builtin.apt:
         name: containerd.io
         state: present
         update_cache: yes
 
-    - name: "5. Containerd config.toml 배포 (template)"
+    - name: 12. containerd 설정 디렉토리 생성
+      ansible.builtin.file:
+        path: /etc/containerd
+        state: directory
+        mode: "0755"
+
+    - name: 13. Containerd config.toml 배포 (template)
       ansible.builtin.template:
         src: containerd_config.toml.j2
         dest: /etc/containerd/config.toml
         mode: "0644"
-      become: yes
-    - name: 7. Containerd 즉시 재시작 및 활성화
+
+    - name: 14. Harbor /etc/hosts 등록
+      ansible.builtin.lineinfile:
+        path: /etc/hosts
+        regexp: "harbor.{{ base_domain }}$"
+        line: "{{ harbor_ip }} harbor.{{ base_domain }}"
+        state: present
+
+    - name: 18. Containerd 재시작 및 활성화
       ansible.builtin.systemd:
         name: containerd
         state: restarted
         enabled: yes
         daemon_reload: yes
 
-    - name: 8. Containerd 소켓 준비 대기
-      wait_for:
+    - name: 19. Containerd 소켓 준비 대기
+      ansible.builtin.wait_for:
         path: /run/containerd/containerd.sock
         state: present
         timeout: 30
 
+    - name: 20. Containerd CRI 소켓 확인
+      ansible.builtin.wait_for:
+        path: /run/containerd/containerd.sock
+        state: present
+        timeout: 30
+      changed_when: false
+
+    - name: 21. Harbor pause 이미지 pull 테스트
+      ansible.builtin.shell: |
+        set -e
+        ctr image pull --user '{{ harbor_robot_user }}:{{ harbor_robot_pass }}' {{ harbor_domain }}/{{ harbor_project }}/pause:{{ pause_version }}
+      args:
+        executable: /bin/bash
+      register: pull_pause_test
+      retries: 5
+      delay: 3
+      until: pull_pause_test.rc == 0
+      changed_when: false
+
     # ---------------------------------------------------------------
     # STEP 3. Kubernetes 패키지 설치
     # ---------------------------------------------------------------
-    - name: 9. K8s 로컬 저장소 확인 (A4에서 등록됐어야 함)
-      ansible.builtin.stat:
-        path: /etc/apt/sources.list.d/miso-local-k8s.list
-      register: k8s_repo_check
-
-    - name: 10. K8s 로컬 저장소 긴급 등록 (미등록 시)
-      ansible.builtin.copy:
-        dest: /etc/apt/sources.list.d/miso-local-k8s.list
-        content: |
-          deb [trusted=yes] http://{{ harbor_ip }}:8080/debs/k8s ./
-      when: not k8s_repo_check.stat.exists
-
-    - name: 11. 외부 K8s 저장소 비활성화 (폐쇄망)
-      ansible.builtin.file:
-        path: /etc/apt/sources.list.d/kubernetes.list
-        state: absent
-
-    - name: 12. kubelet / kubeadm / kubectl 설치
-      apt:
+    - name: 22. kubelet / kubeadm / kubectl 설치
+      ansible.builtin.apt:
         name:
           - kubelet
           - kubeadm
@@ -90,8 +152,8 @@
         state: present
         update_cache: yes
 
-    - name: 13. kubelet / kubeadm / kubectl 버전 고정 (apt-mark hold)
-      dpkg_selections:
+    - name: 23. kubelet / kubeadm / kubectl 버전 고정
+      ansible.builtin.dpkg_selections:
         name: "{{ item }}"
         selection: hold
       loop:
@@ -99,49 +161,121 @@
         - kubeadm
         - kubectl
 
-    - name: 14. kubelet 활성화 (시작은 join 후 자동)
+    - name: 24. kubelet 활성화
       ansible.builtin.systemd:
         name: kubelet
         enabled: yes
         daemon_reload: yes
 
     # ---------------------------------------------------------------
-    # STEP 4. Worker Join (토큰은 master1에서 발급)
+    # STEP 4. 재조인 전 정리
     # ---------------------------------------------------------------
-    - name: 15. (run_once) worker join 커맨드 발급 (master1에서 실행)
+    - name: 25. 기존 kubeadm 상태 확인
+      ansible.builtin.stat:
+        path: /etc/kubernetes/kubelet.conf
+      register: kubelet_conf_check
+
+    - name: 26. 기존 join 흔적 초기화 (이미 join 되어 있지 않은 경우만)
+      when: not kubelet_conf_check.stat.exists
+      block:
+        - name: kubeadm reset
+          ansible.builtin.command: kubeadm reset -f
+          failed_when: false
+          changed_when: false
+
+        - name: CNI / kubelet 잔재 삭제
+          ansible.builtin.file:
+            path: "{{ item }}"
+            state: absent
+          loop:
+            - /etc/cni/net.d
+            - /var/lib/cni
+            - /var/lib/kubelet/pki
+          failed_when: false
+
+        - name: CNI 디렉토리 재생성
+          ansible.builtin.file:
+            path: /etc/cni/net.d
+            state: directory
+            mode: "0755"
+
+        - name: kubelet 재시작
+          ansible.builtin.systemd:
+            name: kubelet
+            state: restarted
+            enabled: yes
+
+    # ---------------------------------------------------------------
+    # STEP 5. Worker Join
+    # ---------------------------------------------------------------
+    - name: 26-b. join 직전 containerd CRI 최종 확인
+      ansible.builtin.shell: |
+        for i in $(seq 1 30); do
+          if ctr version >/dev/null 2>&1; then
+            echo "containerd CRI ready"
+            exit 0
+          fi
+          echo "Waiting for containerd CRI... ($i/30)"
+          sleep 2
+        done
+        echo "containerd CRI timeout"
+        exit 1
+      args:
+        executable: /bin/bash
+      changed_when: false
+
+    - name: 27. (run_once) worker join 커맨드 발급 (master1에서 실행)
       delegate_to: master1
       run_once: true
       become: yes
       environment:
         KUBECONFIG: /etc/kubernetes/admin.conf
-      command: kubeadm token create --print-join-command
+      ansible.builtin.command: kubeadm token create --print-join-command
       register: worker_join_cmd
 
-    - name: 16. worker kubeadm join 실행
-      command: "{{ worker_join_cmd.stdout }}"
+    - name: 28. worker kubeadm join 실행
+      ansible.builtin.command: "{{ worker_join_cmd.stdout }}"
       args:
         creates: /etc/kubernetes/kubelet.conf
+      register: join_result
+
+    - name: 29. kubelet 재시작
+      ansible.builtin.systemd:
+        name: kubelet
+        state: restarted
+        enabled: yes
+      when: join_result is changed
 
     # ---------------------------------------------------------------
-    # STEP 5. (선택) Bastion에서 조인 결과 확인
-    #  - bastion에서 kubectl을 쓸 수 있게 /tmp/kubeconfig-admin.conf가 있어야 합니다.
-    #  - 없으면 이 블록은 무시해도 됩니다.
+    # STEP 6. 상태 확인
     # ---------------------------------------------------------------
-    - name: 99. (run_once) bastion에서 노드 상태 확인 (가능한 경우)
+    - name: 30. kubelet 상태 확인
+      ansible.builtin.shell: |
+        systemctl is-active kubelet
+      args:
+        executable: /bin/bash
+      register: kubelet_active
+      changed_when: false
+      failed_when: false
+
+    - name: 31. worker 노드 상태 확인 (bastion 가능 시)
       delegate_to: localhost
       run_once: true
       become: false
       environment:
         KUBECONFIG: /tmp/kubeconfig-admin.conf
-      shell: |
+      ansible.builtin.shell: |
         kubectl get nodes -o wide
+        kubectl get pods -n calico-system -o wide
+      args:
+        executable: /bin/bash
       register: nodes_out
       changed_when: false
       failed_when: false
 
-    - name: 99-b. (run_once) 노드 출력
+    - name: 32. 결과 출력
+      ansible.builtin.debug:
+        var: nodes_out.stdout_lines
       delegate_to: localhost
       run_once: true
-      debug:
-        var: nodes_out.stdout_lines
       when: nodes_out is defined
