@@ -225,32 +225,32 @@
 #      changed_when: true
 
 
-    # ---------------------------------------------------------------
-    # STEP 6. Harbor 인증서 교체
-    # (Harbor VM에서 직접 처리)
-    # ---------------------------------------------------------------
-    - name: "6. Harbor 인증서 교체 및 재시작"
-      ansible.builtin.shell: |
-        cp {{ playbook_dir }}/tls.crt /etc/harbor/certs/harbor.crt
-        cp {{ playbook_dir }}/tls.key /etc/harbor/certs/harbor.key
-        cp {{ playbook_dir }}/ca.crt \
-          /usr/local/share/ca-certificates/miso-root-ca.crt
-        update-ca-certificates
-        cd /opt/harbor && docker compose down && docker compose up -d
-      become: yes
-      delegate_to: "{{ groups['harbor'][0] }}"
-      changed_when: true
+    # # ---------------------------------------------------------------
+    # # STEP 6. Harbor 인증서 교체
+    # # (Harbor VM에서 직접 처리)
+    # # ---------------------------------------------------------------
+    # - name: "6. Harbor 인증서 교체 및 재시작"
+    #   ansible.builtin.shell: |
+    #     cp {{ playbook_dir }}/tls.crt /etc/harbor/certs/harbor.crt
+    #     cp {{ playbook_dir }}/tls.key /etc/harbor/certs/harbor.key
+    #     cp {{ playbook_dir }}/ca.crt \
+    #       /usr/local/share/ca-certificates/miso-root-ca.crt
+    #     update-ca-certificates
+    #     cd /opt/harbor && docker compose down && docker compose up -d
+    #   become: yes
+    #   delegate_to: "{{ groups['harbor'][0] }}"
+    #   changed_when: true
 
-    - name: "6-b. Harbor 기동 대기"
-      ansible.builtin.uri:
-        url: "https://{{ harbor_domain }}/api/v2.0/health"
-        validate_certs: no
-        status_code: 200
-      register: harbor_health
-      until: harbor_health.status == 200
-      retries: 30
-      delay: 10
-      delegate_to: "{{ groups['harbor'][0] }}"
+    # - name: "6-b. Harbor 기동 대기"
+    #   ansible.builtin.uri:
+    #     url: "https://{{ harbor_domain }}/api/v2.0/health"
+    #     validate_certs: no
+    #     status_code: 200
+    #   register: harbor_health
+    #   until: harbor_health.status == 200
+    #   retries: 30
+    #   delay: 10
+    #   delegate_to: "{{ groups['harbor'][0] }}"
 
     # ---------------------------------------------------------------
     # STEP 7. Grafana nginx reverse proxy + TLS 설정

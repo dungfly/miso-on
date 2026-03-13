@@ -30,7 +30,6 @@
     - name: Update and Upgrade apt packages
       apt:
         update_cache: yes
-        upgrade: dist
         cache_valid_time: 3600
 
     - name: Install Essential Management Tools

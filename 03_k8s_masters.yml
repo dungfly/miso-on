@@ -6,6 +6,8 @@
     harbor_ip: "{{ hostvars[groups['harbor'][0]]['ansible_host'] }}"
     monitor_ip: "{{ hostvars[groups['monitoring'][0]]['ansible_host'] }}"
     k8s_version: "1.30"
+    k8s_version_full: "v1.30.14"
+    pause_version: "3.10.1"
     pod_cidr: "10.244.0.0/16"
     api_endpoint: "10.1.1.10" # HAProxy IP (6443 포트 중계용)
 
@@ -18,68 +20,106 @@
       loop:
         - overlay
         - br_netfilter
+      changed_when: false
 
     - name: 2. 커널 모듈 부팅 시 자동 로드 설정
-      copy:
+      ansible.builtin.copy:
         dest: /etc/modules-load.d/k8s.conf
+        mode: "0644"
         content: |
           overlay
           br_netfilter
 
-    - name: 3. sysctl 네트워크 설정 (Persistence 포함)
-      ansible.builtin.command: sysctl -w {{ item.name }}={{ item.value }}
-      loop:
-        - { name: 'net.bridge.bridge-nf-call-iptables',  value: '1' }
-        - { name: 'net.bridge.bridge-nf-call-ip6tables', value: '1' }
-        - { name: 'net.ipv4.ip_forward',                 value: '1' }
+    - name: 3. sysctl 영구 설정 파일 배포
+      ansible.builtin.copy:
+        dest: /etc/sysctl.d/99-kubernetes-cri.conf
+        mode: "0644"
+        content: |
+          net.bridge.bridge-nf-call-iptables = 1
+          net.bridge.bridge-nf-call-ip6tables = 1
+          net.ipv4.ip_forward = 1
+
+    - name: 4. sysctl 적용
+      ansible.builtin.command: sysctl --system
+      changed_when: false
 
     # ---------------------------------------------------------------
     # STEP 2. Containerd 설치 및 설정
     # ---------------------------------------------------------------
-    - name: 4. Containerd 설치
-      apt:
-        name: containerd
+    - name: 5. Docker 로컬 저장소 등록
+      ansible.builtin.copy:
+        dest: /etc/apt/sources.list.d/miso-local-docker.list
+        mode: "0644"
+        content: |
+          deb [trusted=yes] http://{{ harbor_ip }}:8080/debs/docker ./
+
+    - name: 6. K8s 로컬 저장소 확인 (A4에서 등록됐어야 함)
+      ansible.builtin.stat:
+        path: /etc/apt/sources.list.d/miso-local-k8s.list
+      register: k8s_repo_check
+
+    - name: 7. K8s 로컬 저장소 긴급 등록 (미등록 시)
+      ansible.builtin.copy:
+        dest: /etc/apt/sources.list.d/miso-local-k8s.list
+        mode: "0644"
+        content: |
+          deb [trusted=yes] http://{{ harbor_ip }}:8080/debs/k8s ./
+      when: not k8s_repo_check.stat.exists
+
+    - name: 8. 외부 저장소 비활성화
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - /etc/apt/sources.list.d/docker.list
+        - /etc/apt/sources.list.d/kubernetes.list
+
+    - name: 9. Containerd 설치
+      ansible.builtin.apt:
+        name: containerd.io
         state: present
         update_cache: yes
 
-    - name: 5. Containerd 기본 설정 생성
-      shell: |
+    - name: 10. containerd 설정 디렉토리 생성
+      ansible.builtin.file:
+        path: /etc/containerd
+        state: directory
+        mode: "0755"
+
+    - name: 11. Containerd 기본 설정 생성 및 pause direct path 강제
+      ansible.builtin.shell: |
+        set -e
         mkdir -p /etc/containerd
         containerd config default > /etc/containerd/config.toml
+
+        sed -i "s|config_path = ''|config_path = '/etc/containerd/certs.d'|g" /etc/containerd/config.toml
+        sed -i 's|config_path = ""|config_path = "/etc/containerd/certs.d"|g' /etc/containerd/config.toml
+        sed -i 's/SystemdCgroup = false/SystemdCgroup = true/g' /etc/containerd/config.toml
+
+        sed -i -E 's#(^[[:space:]]*sandbox_image = ).*#\1"{{ harbor_domain }}/{{ harbor_project }}/pause:{{ pause_version }}"#' /etc/containerd/config.toml || true
+        sed -i -E 's#(^[[:space:]]*sandbox = ).*#\1"{{ harbor_domain }}/{{ harbor_project }}/pause:{{ pause_version }}"#' /etc/containerd/config.toml || true
+
+        echo "=== containerd config excerpt ==="
+        grep -nE "config_path|SystemdCgroup|sandbox_image|sandbox = " /etc/containerd/config.toml || true
       args:
-        creates: /etc/containerd/config.toml
+        executable: /bin/bash
+      register: containerd_config_build
+      changed_when: true
 
-    - name: 6. Containerd SystemdCgroup 활성화
-      replace:
-        path: /etc/containerd/config.toml
-        regexp: 'SystemdCgroup = false'
-        replace: 'SystemdCgroup = true'
-
-    - name: "6-b. sandbox_image를 Harbor pause:3.9로 변경"
-      ansible.builtin.replace:
-        path: /etc/containerd/config.toml
-        regexp: 'sandbox_image = ".*"'
-        replace: 'sandbox_image = "{{ harbor_domain }}/{{ harbor_project }}/pause:3.9"'
-
-    - name: "Harbor /etc/hosts 등록"
+    - name: 12. Harbor /etc/hosts 등록
       ansible.builtin.lineinfile:
         path: /etc/hosts
         regexp: "harbor.{{ base_domain }}$"
         line: "{{ harbor_ip }} harbor.{{ base_domain }}"
         state: present
 
-    - name: "containerd certs.d 디렉토리 생성"
+    - name: 13. containerd certs.d 디렉토리 생성
       ansible.builtin.file:
-        path: "/etc/containerd/certs.d/{{ item }}"
+        path: "/etc/containerd/certs.d/{{ harbor_domain }}"
         state: directory
         mode: "0755"
-      loop:
-        - "{{ harbor_domain }}"
-        - "registry.k8s.io"
-        - "docker.io"
-        - "quay.io"
 
-    - name: "Harbor mirror hosts.toml 설정 (인증 포함)"
+    - name: 14. Harbor direct hosts.toml 설정 (인증 포함)
       ansible.builtin.copy:
         dest: "/etc/containerd/certs.d/{{ harbor_domain }}/hosts.toml"
         mode: "0600"
@@ -91,84 +131,69 @@
           [host."https://{{ harbor_domain }}".header]
             Authorization = ["Basic {{ (harbor_robot_user + ':' + harbor_robot_pass) | b64encode }}"]
 
-    - name: "registry.k8s.io → Harbor mirror 설정"
-      ansible.builtin.copy:
-        dest: /etc/containerd/certs.d/registry.k8s.io/hosts.toml
-        mode: "0600"
-        content: |
-          server = "https://registry.k8s.io"
-          [host."https://{{ harbor_domain }}"]
-            capabilities = ["pull", "resolve"]
-            skip_verify = true
-          [host."https://{{ harbor_domain }}".header]
-            Authorization = ["Basic {{ (harbor_robot_user + ':' + harbor_robot_pass) | b64encode }}"]
+    - name: 15. containerd config_path 검증
+      ansible.builtin.shell: |
+        set -e
+        grep -n "config_path = '/etc/containerd/certs.d'" /etc/containerd/config.toml
+        grep -n "{{ harbor_domain }}/{{ harbor_project }}/pause:{{ pause_version }}" /etc/containerd/config.toml
+      args:
+        executable: /bin/bash
+      changed_when: false
 
-    - name: "docker.io → Harbor mirror 설정"
-      ansible.builtin.copy:
-        dest: /etc/containerd/certs.d/docker.io/hosts.toml
-        mode: "0600"
-        content: |
-          server = "https://docker.io"
-          [host."https://{{ harbor_domain }}"]
-            capabilities = ["pull", "resolve"]
-            skip_verify = true
-          [host."https://{{ harbor_domain }}".header]
-            Authorization = ["Basic {{ (harbor_robot_user + ':' + harbor_robot_pass) | b64encode }}"]
-
-    - name: "quay.io → Harbor mirror 설정"
-      ansible.builtin.copy:
-        dest: /etc/containerd/certs.d/quay.io/hosts.toml
-        mode: "0600"
-        content: |
-          server = "https://quay.io"
-          [host."https://{{ harbor_domain }}"]
-            capabilities = ["pull", "resolve"]
-            skip_verify = true
-          [host."https://{{ harbor_domain }}".header]
-            Authorization = ["Basic {{ (harbor_robot_user + ':' + harbor_robot_pass) | b64encode }}"]
-
-    - name: "containerd config_path 설정 (hosts.toml 활성화)"
-      ansible.builtin.replace:
-        path: /etc/containerd/config.toml
-        regexp: 'config_path = ""'
-        replace: 'config_path = "/etc/containerd/certs.d"'
-      ignore_errors: yes
-
-    - name: 7. Containerd 즉시 재시작 및 활성화
+    - name: 16. Containerd 재시작 및 활성화
       ansible.builtin.systemd:
         name: containerd
         state: restarted
         enabled: yes
         daemon_reload: yes
 
-    - name: 8. Containerd 소켓 준비 대기
-      wait_for:
+    - name: 17. Containerd 소켓 준비 대기
+      ansible.builtin.wait_for:
         path: /run/containerd/containerd.sock
         state: present
         timeout: 30
 
+    - name: 18. Containerd CRI 응답 확인
+      ansible.builtin.shell: |
+        set -e
+        crictl --runtime-endpoint unix:///run/containerd/containerd.sock info >/dev/null
+      args:
+        executable: /bin/bash
+      register: cri_check
+      retries: 10
+      delay: 3
+      until: cri_check.rc == 0
+      changed_when: false
+
+    - name: 19. Harbor pause 이미지 pull 테스트
+      ansible.builtin.shell: |
+        set -e
+        crictl --runtime-endpoint unix:///run/containerd/containerd.sock pull {{ harbor_domain }}/{{ harbor_project }}/pause:{{ pause_version }}
+      args:
+        executable: /bin/bash
+      register: pull_pause_test
+      retries: 5
+      delay: 3
+      until: pull_pause_test.rc == 0
+      changed_when: false
+
+    - name: 20. Harbor kube-apiserver 이미지 pull 테스트
+      ansible.builtin.shell: |
+        set -e
+        crictl --runtime-endpoint unix:///run/containerd/containerd.sock pull {{ harbor_domain }}/{{ harbor_project }}/kube-apiserver:{{ k8s_version_full }}
+      args:
+        executable: /bin/bash
+      register: pull_apiserver_test
+      retries: 5
+      delay: 3
+      until: pull_apiserver_test.rc == 0
+      changed_when: false
+
     # ---------------------------------------------------------------
     # STEP 3. Kubernetes 패키지 설치
     # ---------------------------------------------------------------
-    - name: 9. K8s 로컬 저장소 확인 (A4에서 등록됐어야 함)
-      ansible.builtin.stat:
-        path: /etc/apt/sources.list.d/miso-local-k8s.list
-      register: k8s_repo_check
-
-    - name: 10. K8s 로컬 저장소 긴급 등록 (미등록 시)
-      ansible.builtin.copy:
-        dest: /etc/apt/sources.list.d/miso-local-k8s.list
-        content: |
-          deb [trusted=yes] http://{{ harbor_ip }}:8080/debs/k8s ./
-      when: not k8s_repo_check.stat.exists
-
-    - name: 11. 외부 K8s 저장소 비활성화 (폐쇄망)
-      ansible.builtin.file:
-        path: /etc/apt/sources.list.d/kubernetes.list
-        state: absent
-
-    - name: 12. kubelet / kubeadm / kubectl 설치
-      apt:
+    - name: 21. kubelet / kubeadm / kubectl 설치
+      ansible.builtin.apt:
         name:
           - kubelet
           - kubeadm
@@ -176,8 +201,8 @@
         state: present
         update_cache: yes
 
-    - name: 13. kubelet / kubeadm / kubectl 버전 고정 (apt-mark hold)
-      dpkg_selections:
+    - name: 22. kubelet / kubeadm / kubectl 버전 고정 (apt-mark hold)
+      ansible.builtin.dpkg_selections:
         name: "{{ item }}"
         selection: hold
       loop:
@@ -185,7 +210,7 @@
         - kubeadm
         - kubectl
 
-    - name: 14. kubelet 활성화 (시작은 kubeadm init 후 자동)
+    - name: 23. kubelet 활성화
       ansible.builtin.systemd:
         name: kubelet
         enabled: yes
@@ -193,83 +218,154 @@
 
     # ---------------------------------------------------------------
     # STEP 4. 클러스터 초기화 (master1)
+    # 실패 시 자동 로그 수집
     # ---------------------------------------------------------------
-    - name: 15. kubeadm init (master1 Only)
-      command: >
-        kubeadm init
-        --pod-network-cidr={{ pod_cidr }}
-        --control-plane-endpoint="{{ api_endpoint }}:6443"
-        --upload-certs
-        --image-repository {{ harbor_domain }}/{{ harbor_project }}
+    - name: 24~26. kubeadm init + health check + 로그 수집 (master1 Only)
       when: inventory_hostname == 'master1'
-      args:
-        creates: /etc/kubernetes/admin.conf
+      block:
+        - name: 24. kubeadm init (master1 Only)
+          ansible.builtin.command: >
+            kubeadm init
+            --pod-network-cidr={{ pod_cidr }}
+            --control-plane-endpoint="{{ api_endpoint }}:6443"
+            --upload-certs
+            --image-repository {{ harbor_domain }}/{{ harbor_project }}
+            --kubernetes-version={{ k8s_version_full }}
+          args:
+            creates: /etc/kubernetes/admin.conf
+          register: kubeadm_init_result
 
-    - name: 16. 로컬 API 서버 포트 기동 대기 (master1 Only)
-      wait_for:
-        host: 127.0.0.1
-        port: 6443
-        delay: 10
-        timeout: 180
-      when: inventory_hostname == 'master1'
+        - name: 25. 로컬 API 서버 포트 기동 대기 (master1 Only)
+          ansible.builtin.wait_for:
+            host: 127.0.0.1
+            port: 6443
+            delay: 10
+            timeout: 180
 
-    - name: 17. API 서버 /healthz 정상 응답 대기 (master1 Only)
-      uri:
-        url: https://127.0.0.1:6443/healthz
-        validate_certs: no
-        status_code: 200
-      register: healthz_result
-      until: healthz_result.status == 200
-      retries: 30
-      delay: 10
-      when: inventory_hostname == 'master1'
+        - name: 26. API 서버 /healthz 정상 응답 대기 (master1 Only)
+          ansible.builtin.uri:
+            url: https://127.0.0.1:6443/healthz
+            validate_certs: no
+            status_code: 200
+          register: healthz_result
+          until: healthz_result.status == 200
+          retries: 30
+          delay: 10
+
+      rescue:
+        - name: 24-r1. kubelet 상태 수집
+          ansible.builtin.shell: |
+            systemctl status kubelet --no-pager || true
+          args:
+            executable: /bin/bash
+          register: kubelet_status
+          changed_when: false
+
+        - name: 24-r2. kubelet journal 수집
+          ansible.builtin.shell: |
+            journalctl -xeu kubelet --no-pager | tail -n 250 || true
+          args:
+            executable: /bin/bash
+          register: kubelet_journal
+          changed_when: false
+
+        - name: 24-r3. crictl ps 수집
+          ansible.builtin.shell: |
+            crictl --runtime-endpoint unix:///run/containerd/containerd.sock ps -a || true
+          args:
+            executable: /bin/bash
+          register: crictl_ps
+          changed_when: false
+
+        - name: 24-r4. 모든 파드 목록 수집
+          ansible.builtin.shell: |
+            crictl --runtime-endpoint unix:///run/containerd/containerd.sock pods || true
+          args:
+            executable: /bin/bash
+          register: crictl_pods
+          changed_when: false
+
+        - name: 24-r5. kubelet 상태 출력
+          ansible.builtin.debug:
+            var: kubelet_status.stdout_lines
+
+        - name: 24-r6. kubelet journal 출력
+          ansible.builtin.debug:
+            var: kubelet_journal.stdout_lines
+
+        - name: 24-r7. crictl ps 출력
+          ansible.builtin.debug:
+            var: crictl_ps.stdout_lines
+
+        - name: 24-r8. crictl pods 출력
+          ansible.builtin.debug:
+            var: crictl_pods.stdout_lines
+
+        - name: 24-r9. kubeadm init 실패 종료
+          ansible.builtin.fail:
+            msg: "kubeadm init failed. 위 수집 로그를 확인하세요."
 
     # ---------------------------------------------------------------
     # STEP 4-b. bastion에서 kubectl용 kubeconfig 준비
     # ---------------------------------------------------------------
-    - name: 17-b. master1 admin.conf를 bastion으로 fetch (master1 Only)
-      fetch:
+    - name: 27. master1 admin.conf를 bastion으로 fetch (master1 Only)
+      ansible.builtin.fetch:
         src: /etc/kubernetes/admin.conf
         dest: /tmp/kubeconfig-admin.conf
         flat: yes
-      when: inventory_hostname == 'master1'
+      register: adminconf_fetch
+      when:
+        - inventory_hostname == 'master1'
+        - healthz_result is defined
+        - healthz_result.status == 200
 
-    - name: 17-c. bastion kubeconfig의 server를 HAProxy로 고정 (run_once)
+    - name: 28. bastion kubeconfig의 server를 HAProxy로 고정 (run_once)
       delegate_to: localhost
       run_once: true
       become: false
-      shell: |
+      ansible.builtin.shell: |
         set -e
         test -f /tmp/kubeconfig-admin.conf
         sed -i 's|server: https://.*:6443|server: https://{{ api_endpoint }}:6443|g' /tmp/kubeconfig-admin.conf
+      args:
+        executable: /bin/bash
+      when:
+        - hostvars['master1'].adminconf_fetch is defined
+        - hostvars['master1'].adminconf_fetch is not failed
 
-    - name: 17-d. bastion에서 kubectl client 확인 (run_once)
+    - name: 29. bastion에서 kubectl client 확인 (run_once)
       delegate_to: localhost
       run_once: true
       become: false
-      command: kubectl version --client=true
+      ansible.builtin.command: kubectl version --client=true
+      when:
+        - hostvars['master1'].adminconf_fetch is defined
+        - hostvars['master1'].adminconf_fetch is not failed
 
-    - name: 17-e. bastion kubeconfig로 노드 확인 (run_once)
+    - name: 30. bastion kubeconfig로 노드 확인 (run_once)
       delegate_to: localhost
       run_once: true
       become: false
       environment:
         KUBECONFIG: /tmp/kubeconfig-admin.conf
-      command: kubectl get nodes
+      ansible.builtin.command: kubectl get nodes
       failed_when: false
+      when:
+        - hostvars['master1'].adminconf_fetch is defined
+        - hostvars['master1'].adminconf_fetch is not failed
 
     # ---------------------------------------------------------------
-    # STEP 5. 조인 정보 추출 (master1) - /etc/kubernetes/admin.conf 직접 사용
+    # STEP 5. 조인 정보 추출 (master1)
     # ---------------------------------------------------------------
-    - name: 18-b. 조인 커맨드 추출 (master1 Only)
-      shell: kubeadm token create --print-join-command
+    - name: 31. 조인 커맨드 추출 (master1 Only)
+      ansible.builtin.shell: kubeadm token create --print-join-command
       environment:
         KUBECONFIG: /etc/kubernetes/admin.conf
       register: join_cmd
       when: inventory_hostname == 'master1'
 
-    - name: 18-c. 인증서 키 추출 (master1 Only)
-      shell: kubeadm init phase upload-certs --upload-certs | tail -n 1
+    - name: 32. 인증서 키 추출 (master1 Only)
+      ansible.builtin.shell: kubeadm init phase upload-certs --upload-certs | tail -n 1
       environment:
         KUBECONFIG: /etc/kubernetes/admin.conf
       register: cert_key
@@ -278,48 +374,56 @@
     # ---------------------------------------------------------------
     # STEP 6. master2, 3 조인
     # ---------------------------------------------------------------
-    - name: 20. 마스터 조인 (master2, 3)
-      command: >
+    - name: 33. 마스터 조인 (master2, 3)
+      ansible.builtin.command: >
         {{ hostvars['master1']['join_cmd']['stdout'] }}
         --control-plane
         --certificate-key {{ hostvars['master1']['cert_key']['stdout'] }}
-      when: inventory_hostname in ['master2', 'master3']
+      when:
+        - inventory_hostname in ['master2', 'master3']
+        - hostvars['master1']['join_cmd'] is defined
+        - hostvars['master1']['cert_key'] is defined
       args:
         creates: /etc/kubernetes/admin.conf
 
     # ---------------------------------------------------------------
     # STEP 7. CNI 설치 (bastion에서 실행)
-    # - upstream registry mirror에 의존하지 않고
-    # - Harbor에 수집된 오프라인 이미지 경로로 manifest rewrite 후 적용
     # ---------------------------------------------------------------
-    - name: 21. tigera-operator manifest 다운로드 (bastion run_once)
+    - name: 34. tigera-operator manifest 다운로드 (bastion run_once)
       delegate_to: localhost
       run_once: true
       become: false
-      shell: |
+      ansible.builtin.shell: |
         set -e
-        curl -fsSL -o /tmp/tigera-operator.yaml \
-          http://{{ harbor_ip }}:8080/manifests/tigera-operator.yaml
+        curl -fsSL -o /tmp/tigera-operator.yaml           http://{{ harbor_ip }}:8080/manifests/tigera-operator.yaml
+      args:
+        executable: /bin/bash
+      when:
+        - hostvars['master1'].adminconf_fetch is defined
+        - hostvars['master1'].adminconf_fetch is not failed
 
-    - name: 21-b. tigera-operator image를 Harbor 경로로 rewrite (bastion run_once)
+    - name: 35. tigera-operator image를 Harbor 경로로 rewrite (bastion run_once)
       delegate_to: localhost
       run_once: true
       become: false
-      shell: |
+      ansible.builtin.shell: |
         set -e
-        sed -i 's|quay.io/tigera/operator:v1.32.3|{{ harbor_domain }}/{{ harbor_project }}/tigera-operator:v1.32.3|g' \
-          /tmp/tigera-operator.yaml
+        sed -i 's|quay.io/tigera/operator:v1.32.3|{{ harbor_domain }}/{{ harbor_project }}/tigera-operator:v1.32.3|g'           /tmp/tigera-operator.yaml
+      args:
+        executable: /bin/bash
+      when:
+        - hostvars['master1'].adminconf_fetch is defined
+        - hostvars['master1'].adminconf_fetch is not failed
 
-    - name: 21-c-pre. API 서버 RBAC 안정화 대기
+    - name: 36. API 서버 RBAC 안정화 대기
       delegate_to: localhost
       run_once: true
       become: false
       environment:
         KUBECONFIG: /tmp/kubeconfig-admin.conf
-      shell: |
-        # master 조인 직후 RBAC 초기화 완료 대기
+      ansible.builtin.shell: |
         for i in $(seq 1 20); do
-          result=$(kubectl auth can-i patch customresourcedefinitions 2>/dev/null)
+          result=$(kubectl auth can-i patch customresourcedefinitions 2>/dev/null || true)
           if [ "$result" = "yes" ]; then
             echo "RBAC ready"
             exit 0
@@ -329,50 +433,65 @@
         done
         echo "RBAC wait timeout - proceeding anyway"
         exit 0
+      args:
+        executable: /bin/bash
+      when:
+        - hostvars['master1'].adminconf_fetch is defined
+        - hostvars['master1'].adminconf_fetch is not failed
 
-    - name: 21-c. tigera-operator 설치 (bastion run_once)
+    - name: 37. tigera-operator 설치 (bastion run_once)
       delegate_to: localhost
       run_once: true
       become: false
       environment:
         KUBECONFIG: /tmp/kubeconfig-admin.conf
-      shell: |
+      ansible.builtin.shell: |
         kubectl apply --server-side --force-conflicts -f /tmp/tigera-operator.yaml --validate=false
+      args:
+        executable: /bin/bash
+      when:
+        - hostvars['master1'].adminconf_fetch is defined
+        - hostvars['master1'].adminconf_fetch is not failed
 
-    - name: 21-d. tigera-operator Pod Ready 대기 (bastion run_once)
+    - name: 38. tigera-operator Pod Ready 대기 (bastion run_once)
       delegate_to: localhost
       run_once: true
       become: false
       environment:
         KUBECONFIG: /tmp/kubeconfig-admin.conf
-      shell: |
+      ansible.builtin.shell: |
         kubectl -n tigera-operator rollout status deployment/tigera-operator --timeout=300s
+      args:
+        executable: /bin/bash
       retries: 5
       delay: 10
       register: tigera_wait
       until: tigera_wait.rc == 0
       changed_when: false
+      when:
+        - hostvars['master1'].adminconf_fetch is defined
+        - hostvars['master1'].adminconf_fetch is not failed
 
-    - name: 21-e. Installation CRD 등록 대기 (bastion run_once)
+    - name: 39. Installation CRD 등록 대기 (bastion run_once)
       delegate_to: localhost
       run_once: true
       become: false
       environment:
         KUBECONFIG: /tmp/kubeconfig-admin.conf
-      shell: |
+      ansible.builtin.shell: |
         kubectl get crd installations.operator.tigera.io
+      args:
+        executable: /bin/bash
       retries: 20
       delay: 10
       register: crd_wait
       until: crd_wait.rc == 0
       changed_when: false
+      when:
+        - hostvars['master1'].adminconf_fetch is defined
+        - hostvars['master1'].adminconf_fetch is not failed
 
-    - name: 22. Calico Installation CR 생성 (registry 방식, bastion run_once)
-      # tigera-operator의 Installation CR에 registry/imagePath/imagePrefix를 지정하면
-      # operator가 모든 calico 이미지를 Harbor에서 자동으로 pull함.
-      # 이미지 경로: {registry}/{imagePath}/{imagePrefix}{imageName}:{tag}
-      # = harbor.miso.local / miso / calico- / node:v3.27.0
-      # = harbor.miso.local/miso/calico-node:v3.27.0
+    - name: 40. Calico Installation CR 생성 (registry 방식, bastion run_once)
       delegate_to: localhost
       run_once: true
       become: false
@@ -400,29 +519,43 @@
           metadata:
             name: default
           spec: {}
+      when:
+        - hostvars['master1'].adminconf_fetch is defined
+        - hostvars['master1'].adminconf_fetch is not failed
 
-    - name: 22-c. Calico custom-resources 적용 (bastion run_once)
+    - name: 41. Calico custom-resources 적용 (bastion run_once)
       delegate_to: localhost
       run_once: true
       become: false
       environment:
         KUBECONFIG: /tmp/kubeconfig-admin.conf
-      shell: |
+      ansible.builtin.shell: |
         kubectl apply -f /tmp/custom-resources.yaml --validate=false
+      args:
+        executable: /bin/bash
+      when:
+        - hostvars['master1'].adminconf_fetch is defined
+        - hostvars['master1'].adminconf_fetch is not failed
 
-    - name: 23. 노드/파드 상태 확인 (bastion run_once)
+    - name: 42. 노드/파드 상태 확인 (bastion run_once)
       delegate_to: localhost
       run_once: true
       become: false
       environment:
         KUBECONFIG: /tmp/kubeconfig-admin.conf
-      shell: |
+      ansible.builtin.shell: |
         kubectl get nodes -o wide
         kubectl get pods -A
+      args:
+        executable: /bin/bash
       register: verify_out
       changed_when: false
+      when:
+        - hostvars['master1'].adminconf_fetch is defined
+        - hostvars['master1'].adminconf_fetch is not failed
 
-    - debug:
+    - name: 43. 최종 결과 출력
+      ansible.builtin.debug:
         var: verify_out.stdout_lines
       delegate_to: localhost
       run_once: true

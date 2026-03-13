@@ -204,6 +204,14 @@ COMMON_ROOT_PKGS=(
   nginx
   apt-utils
   rsync
+  # 01_common_setup.yml - k8s/lb 전체 노드 공통 패키지
+  jq
+  git
+  vim
+  net-tools
+  htop
+  iptables
+  chrony
 )
 
 echo "  의존성 포함 전체 패키지 목록 계산 중..."

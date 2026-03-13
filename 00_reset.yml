@@ -1,257 +1,162 @@
 ---
-# =================================================================
-# 00_reset.yml - Kubernetes 클러스터 초기화
+# reset은 다음을 '초기화'합니다:
+# - kubeadm init / join 결과
+# - /etc/kubernetes, /var/lib/kubelet, /var/lib/etcd
+# - CNI 설정 및 네트워크 인터페이스(cni0, flannel.1)
+# - kube-proxy / CNI 관련 iptables
+# - bastion의 임시 kubeconfig
+# - containerd 설정(config.toml, certs.d)
 #
-# 실행: ansible-playbook -i hosts.ini 00_reset.yml
+# reset은 다음을 '유지'합니다:
+# - 01_common_setup 결과(기본 OS 패키지, 시간대, sysctl 기본값 등)
+# - containerd / kubelet / kubeadm / kubectl 패키지 설치 자체
+# - Harbor CA 파일 자체(필요 시 A3/03에서 다시 배포)
+# - /etc/hosts 의 일반 항목
 #
-# ※ 리셋 범위 선택 (기본: phase2만 리셋)
-#
-#   [phase2만 리셋] K8s 클러스터만 초기화 (기본값)
-#     ansible-playbook -i hosts.ini 00_reset.yml
-#
-#   [phase2+3 리셋] K8s 클러스터 + DB 노드 조인 초기화
-#     ansible-playbook -i hosts.ini 00_reset.yml -e reset_db=true
-#
-#   [전체 리셋] K8s + DB + 앱 데이터 전체 삭제 (PVC 포함)
-#     ansible-playbook -i hosts.ini 00_reset.yml -e reset_db=true -e reset_data=true
-#
-# ※ 리셋 후 재실행 순서:
-#     1. ansible-playbook -i hosts.ini phase2_k8s_cluster.yml
-#     2. bash 04_get-kubeconfig_bastion.sh
-#     3. ansible-playbook -i hosts.ini A3b_post_k8s_setup.yml
-#     4. ansible-playbook -i hosts.ini phase3_db_nodes.yml  (reset_db=true 경우)
-#
-# ※ 리셋되지 않는 것:
-#     - Harbor (이미지/매니페스트 보존)
-#     - Bastion 설정 (kubectl, ansible, SSH 키)
-#     - LB/HAProxy 설정
-#     - OS 기본 설정 (01_common_setup 결과)
-#     - containerd 설치 자체 (재설치 불필요)
-# =================================================================
+# 사용 목적:
+# - phase2_k8s_cluster 재시도 전 깨끗한 상태 만들기
+# - kubeadm init / control-plane join / worker join 실패 후 재시도
 
-# -----------------------------------------------------------------
-# [PLAY 1] Masters - kubeadm reset
-# 리셋 범위: K8s control plane, etcd 데이터, CNI 설정
-# -----------------------------------------------------------------
-- name: "Masters kubeadm reset"
-  hosts: masters
+- name: Reset Kubernetes nodes and bastion artifacts
+  hosts: masters:workers
   become: yes
-  gather_facts: false
+  gather_facts: yes
+
   tasks:
-    - name: "kubeadm reset (control plane + etcd 데이터 삭제)"
+    - name: 1. kubeadm reset
       ansible.builtin.shell: |
-        kubeadm reset -f --ignore-preflight-errors=all
-      ignore_errors: yes
+        kubeadm reset -f || true
+      args:
+        executable: /bin/bash
+      changed_when: false
 
-    - name: "CNI 설정 디렉토리 삭제 (/etc/cni, /opt/cni)"
-      ansible.builtin.file:
-        path: "{{ item }}"
-        state: absent
-      loop:
-        - /etc/cni
-        - /opt/cni
-        - /var/lib/cni
-        - /var/lib/calico
-
-    - name: "K8s 설정 디렉토리 삭제"
+    - name: 2. kube 관련 디렉토리 삭제
       ansible.builtin.file:
         path: "{{ item }}"
         state: absent
       loop:
         - /etc/kubernetes
         - /var/lib/kubelet
-        - /var/lib/etcd
-        - /root/.kube
-        - /home/ubuntu/.kube
-
-    - name: "iptables 규칙 초기화"
-      ansible.builtin.shell: |
-        iptables -F
-        iptables -X
-        iptables -t nat -F
-        iptables -t nat -X
-        iptables -t mangle -F
-        iptables -t mangle -X
-        ipvsadm --clear 2>/dev/null || true
-      ignore_errors: yes
-
-    - name: "containerd 재시작 (남은 컨테이너 정리)"
-      ansible.builtin.systemd:
-        name: containerd
-        state: restarted
-
-# -----------------------------------------------------------------
-# [PLAY 2] Workers - kubeadm reset
-# 리셋 범위: K8s worker 조인 설정, CNI, kubelet 데이터
-# -----------------------------------------------------------------
-- name: "Workers kubeadm reset"
-  hosts: workers
-  become: yes
-  gather_facts: false
-  tasks:
-    - name: "kubeadm reset"
-      ansible.builtin.shell: |
-        kubeadm reset -f --ignore-preflight-errors=all
-      ignore_errors: yes
-
-    - name: "CNI 설정 디렉토리 삭제"
-      ansible.builtin.file:
-        path: "{{ item }}"
-        state: absent
-      loop:
-        - /etc/cni
-        - /opt/cni
+        - /etc/cni/net.d
         - /var/lib/cni
-        - /var/lib/calico
+      ignore_errors: true
 
-    - name: "K8s 설정 디렉토리 삭제"
+    - name: 3. masters only - etcd 데이터 삭제
       ansible.builtin.file:
-        path: "{{ item }}"
+        path: /var/lib/etcd
         state: absent
-      loop:
-        - /etc/kubernetes
-        - /var/lib/kubelet
-        - /root/.kube
-        - /home/ubuntu/.kube
+      when: "'masters' in group_names"
+      ignore_errors: true
 
-    - name: "iptables 규칙 초기화"
-      ansible.builtin.shell: |
-        iptables -F
-        iptables -X
-        iptables -t nat -F
-        iptables -t nat -X
-        iptables -t mangle -F
-        iptables -t mangle -X
-        ipvsadm --clear 2>/dev/null || true
-      ignore_errors: yes
+    - name: 4. containerd 설정 파일 삭제
+      ansible.builtin.file:
+        path: /etc/containerd/config.toml
+        state: absent
+      ignore_errors: true
 
-    - name: "containerd 재시작"
+    - name: 5. containerd certs.d 삭제
+      ansible.builtin.file:
+        path: /etc/containerd/certs.d
+        state: absent
+      ignore_errors: true
+
+    - name: 6. kubelet 서비스 중지
+      ansible.builtin.systemd:
+        name: kubelet
+        state: stopped
+      ignore_errors: true
+
+    - name: 7. containerd 서비스 재시작
       ansible.builtin.systemd:
         name: containerd
         state: restarted
+        enabled: yes
+        daemon_reload: yes
+      ignore_errors: true
 
-# -----------------------------------------------------------------
-# [PLAY 3] DB Nodes - kubeadm reset (reset_db=true 일 때만)
-# 리셋 범위: DB 노드의 K8s worker 조인 설정
-# ※ DB 데이터(/data/postgres, /data/opensearch)는 보존
-#    완전 삭제는 reset_data=true 추가
-# -----------------------------------------------------------------
-- name: "DB Nodes kubeadm reset (reset_db=true 시 실행)"
-  hosts: db_nodes
-  become: yes
-  gather_facts: false
-  tasks:
-    - name: "kubeadm reset"
+    - name: 8. cni/flannel 인터페이스 삭제
       ansible.builtin.shell: |
-        kubeadm reset -f --ignore-preflight-errors=all
-      ignore_errors: yes
-      when: reset_db | default(false) | bool
+        ip link delete cni0 2>/dev/null || true
+        ip link delete flannel.1 2>/dev/null || true
+      args:
+        executable: /bin/bash
+      changed_when: false
 
-    - name: "CNI 설정 디렉토리 삭제"
-      ansible.builtin.file:
-        path: "{{ item }}"
-        state: absent
-      loop:
-        - /etc/cni
-        - /opt/cni
-        - /var/lib/cni
-      when: reset_db | default(false) | bool
-
-    - name: "K8s 설정 디렉토리 삭제"
-      ansible.builtin.file:
-        path: "{{ item }}"
-        state: absent
-      loop:
-        - /etc/kubernetes
-        - /var/lib/kubelet
-      when: reset_db | default(false) | bool
-
-    - name: "iptables 규칙 초기화"
+    - name: 9. kube-proxy / CNI 관련 iptables 정리
       ansible.builtin.shell: |
-        iptables -F
-        iptables -X
-        iptables -t nat -F
-        iptables -t nat -X
-      ignore_errors: yes
-      when: reset_db | default(false) | bool
+        iptables -F || true
+        iptables -t nat -F || true
+        iptables -t mangle -F || true
+        iptables -X || true
+        ip6tables -F || true
+        ip6tables -t nat -F || true
+        ip6tables -t mangle -F || true
+        ip6tables -X || true
+      args:
+        executable: /bin/bash
+      changed_when: false
 
-    - name: "containerd 재시작"
+    - name: 10. kubelet 서비스 재활성화 (시작은 phase2에서 진행)
       ansible.builtin.systemd:
-        name: containerd
-        state: restarted
-      when: reset_db | default(false) | bool
+        name: kubelet
+        enabled: yes
+        daemon_reload: yes
+      ignore_errors: true
 
-    # ※ reset_data=true: PVC 로컬 데이터까지 완전 삭제
-    #    PostgreSQL, OpenSearch, Redis 데이터 모두 삭제됨
-    #    복구 불가 - 신중하게 사용할 것
-    - name: "로컬 PVC 데이터 삭제 (reset_data=true 시 실행)"
-      ansible.builtin.file:
-        path: "{{ item }}"
-        state: absent
-      loop:
-        - /data/postgres
-        - /data/opensearch
-        - /opt/local-path-provisioner
-      when: reset_data | default(false) | bool
-
-# -----------------------------------------------------------------
-# [PLAY 4] Workers - local-path PVC 데이터 삭제 (reset_data=true 시)
-# 리셋 범위: MinIO, Redis PVC 로컬 데이터
-# ※ 복구 불가 - 신중하게 사용할 것
-# -----------------------------------------------------------------
-- name: "Workers local-path PVC 데이터 삭제 (reset_data=true 시)"
-  hosts: workers
-  become: yes
-  gather_facts: false
-  tasks:
-    # ※ reset_data=true: MinIO, Redis PVC 로컬 데이터 완전 삭제
-    #    복구 불가 - 신중하게 사용할 것
-    - name: "local-path-provisioner 데이터 삭제 (MinIO, Redis PVC)"
-      ansible.builtin.file:
-        path: /opt/local-path-provisioner
-        state: absent
-      when: reset_data | default(false) | bool
-
-    - name: "MinIO 호스트 데이터 디렉토리 삭제"
-      ansible.builtin.file:
-        path: /data/minio
-        state: absent
-      when: reset_data | default(false) | bool
-
-# -----------------------------------------------------------------
-# [PLAY 5] Bastion - kubeconfig 및 임시파일 정리
-# 리셋 범위: bastion의 kubeconfig, 임시 manifest 파일
-# ※ ansible, kubectl, SSH 키는 보존
-# -----------------------------------------------------------------
-- name: "Bastion kubeconfig 및 임시파일 정리"
-  hosts: bastion
-  become: no
-  gather_facts: false
-  tasks:
-    - name: "bastion kubeconfig 삭제"
-      ansible.builtin.file:
-        path: "{{ item }}"
-        state: absent
-      loop:
-        - /home/ubuntu/.kube/config
-        - /tmp/kubeconfig-admin.conf
-
-    - name: "임시 manifest 파일 삭제"
+    - name: 11. reset 후 상태 확인
       ansible.builtin.shell: |
-        rm -f /tmp/*.yaml /tmp/*.conf
-      ignore_errors: yes
+        echo "=== hostname ==="
+        hostname
+        echo "=== kubelet ==="
+        systemctl is-enabled kubelet 2>/dev/null || true
+        echo "=== containerd ==="
+        systemctl is-active containerd 2>/dev/null || true
+        echo "=== leftover manifests ==="
+        ls -al /etc/kubernetes/manifests 2>/dev/null || true
+        echo "=== leftover certs.d ==="
+        ls -al /etc/containerd/certs.d 2>/dev/null || true
+      args:
+        executable: /bin/bash
+      register: reset_status
+      changed_when: false
 
-    - name: "리셋 완료 안내"
+    - name: 12. reset 상태 출력
       ansible.builtin.debug:
-        msg:
-          - "======================================================"
-          - " 클러스터 리셋 완료"
-          - "======================================================"
-          - " 다음 단계:"
-          - " 1. ansible-playbook -i hosts.ini phase2_k8s_cluster.yml"
-          - " 2. bash 04_get-kubeconfig_bastion.sh"
-          - " 3. ansible-playbook -i hosts.ini A3b_post_k8s_setup.yml"
-          - ""
-          - " DB 노드도 리셋한 경우:"
-          - " 4. ansible-playbook -i hosts.ini phase3_db_nodes.yml"
-          - "======================================================"
+        var: reset_status.stdout_lines
+
+- name: Reset bastion-side kubeconfig artifacts
+  hosts: bastion
+  become: yes
+  gather_facts: yes
+
+  tasks:
+    - name: 1. bastion 임시 kubeconfig 삭제
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - /tmp/kubeconfig-admin.conf
+        - /home/ubuntu/.kube/config
+      ignore_errors: true
+
+    - name: 2. .kube 디렉토리 생성
+      ansible.builtin.file:
+        path: /home/ubuntu/.kube
+        state: directory
+        owner: ubuntu
+        group: ubuntu
+        mode: "0700"
+
+    - name: 3. bastion reset 결과 출력
+      ansible.builtin.shell: |
+        echo "=== bastion kube artifacts ==="
+        ls -al /tmp/kubeconfig-admin.conf 2>/dev/null || true
+        ls -al /home/ubuntu/.kube 2>/dev/null || true
+      args:
+        executable: /bin/bash
+      register: bastion_reset_status
+      changed_when: false
+
+    - name: 4. bastion reset 상태 출력
+      ansible.builtin.debug:
+        var: bastion_reset_status.stdout_lines

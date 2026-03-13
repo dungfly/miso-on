@@ -343,6 +343,13 @@
     loki_url: "http://{{ hostvars[groups['monitoring'][0]]['ansible_host'] }}:3100/loki/api/v1/push"
 
   tasks:
+    - name: "0. Harbor docker login"
+      shell: >
+        docker login {{ harbor_domain }}
+        -u '{{ harbor_robot_user }}'
+        -p '{{ harbor_robot_pass }}'
+      no_log: true
+
     - name: "1. 설정 디렉토리 생성"
       ansible.builtin.file:
         path: "{{ item }}"
